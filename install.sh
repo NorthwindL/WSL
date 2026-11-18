@@ -5,7 +5,8 @@ umask 022
 
 DRY_RUN=false
 CHECK_ONLY=false
-INSTALL_CHINESE=false
+INSTALL_CHINESE=true
+CLIPBOARD_MODE=native
 UPGRADE=false
 STEP=准备
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wsl-ai-setup"
@@ -22,10 +23,14 @@ trap 'printf "\n安装在【%s】失败（第%s行）。修复报错后可重新
 usage() {
     cat <<'HELP'
 用法 bash install.sh [选项]
-默认精简安装剪贴板桥接及自动启动。
+默认安装中文环境并使用 WSLg 原生剪贴板，不启动剪贴板监听。
   --dry-run         显示安装计划，保持系统当前状态
   --check           检查依赖和后台服务状态
-  --with-chinese    额外安装中文字体、语言和 Fcitx5 输入法
+  --with-chinese    安装中文字体、语言和 Fcitx5 输入法（默认）
+  --without-chinese 不安装中文字体、语言和 Fcitx5 输入法
+  --native          只使用 WSLg 原生剪贴板（默认）
+  --file-session    安装双向文件、图片与文本的独立窗口启动器
+  --with-files      启用 WSLg 到 Windows 的文件复制增强
   --upgrade         显式执行系统软件升级
   --skip-upgrade    跳过系统软件升级
   -h, --help        显示帮助
@@ -39,6 +44,10 @@ parse_args() {
             --dry-run) DRY_RUN=true ;;
             --check) CHECK_ONLY=true ;;
             --with-chinese) INSTALL_CHINESE=true ;;
+            --without-chinese) INSTALL_CHINESE=false ;;
+            --native) CLIPBOARD_MODE=native ;;
+            --file-session) CLIPBOARD_MODE=session ;;
+            --with-files) CLIPBOARD_MODE=files-out ;;
             --upgrade) UPGRADE=true ;;
             --skip-upgrade) UPGRADE=false ;;
             -h|--help) usage; exit 0 ;;
@@ -113,12 +122,23 @@ apt_run() {
 
 check_installation() {
     local failed=0
+    if [[ $CLIPBOARD_MODE == session ]]; then
+        [[ -x $HOME/.local/bin/wsl-clipboard-app &&
+           -x $HOME/.local/lib/wsl-clipboard-session/session &&
+           -r $HOME/.local/lib/wsl-clipboard-session/backend.ps1 ]] || {
+            printf '缺少独立窗口启动器或剪贴板辅助程序。\n' >&2
+            failed=1
+        }
+    fi
     for path in /usr/local/bin/xclip "$HOME/.local/lib/xclip-x11/usr/bin/xclip"; do
         if [[ -x $path ]]; then printf '已安装 %s\n' "$path"; else printf '缺少 %s\n' "$path"; failed=1; fi
     done
-    user_systemctl is-enabled xclip-bridge.service || failed=1
-    user_systemctl is-active xclip-bridge.service || failed=1
-    user_systemctl status xclip-bridge.service --no-pager -l || true
+    for service in xclip-files-bridge.service xclip-linux-files-bridge.service xclip-bridge.service; do
+        if user_systemctl is-enabled "$service" >/dev/null 2>&1 ||
+            user_systemctl is-active "$service" >/dev/null 2>&1; then
+            user_systemctl status "$service" --no-pager -l || true
+        fi
+    done
     return "$failed"
 }
 
@@ -151,6 +171,9 @@ install_packages() {
     if [[ $INSTALL_CHINESE == true ]]; then
         packages+=(locales fonts-noto-cjk fonts-wqy-microhei fontconfig fcitx5
             fcitx5-chinese-addons fcitx5-config-qt fcitx5-frontend-gtk3 fcitx5-frontend-qt5)
+    fi
+    if [[ $CLIPBOARD_MODE == session ]]; then
+        packages+=(xserver-xephyr openbox dbus-daemon xauth x11-utils g++ pkg-config qtbase5-dev)
     fi
     apt_run update
     if [[ $UPGRADE == true ]]; then apt_run upgrade -y; fi
@@ -248,12 +271,13 @@ die() { printf 'xclip: %s\n' "$*" >&2; exit 1; }
 
 direction=in
 watch_mode=false
+watch_files_out=false
 target=UTF8_STRING
 selection=clipboard
 files=()
 while (($#)); do
     case "$1" in
-        --watch) watch_mode=true ;;
+        --watch-files-out) watch_mode=true; watch_files_out=true ;;
         -o|-out) direction=out ;;
         -i|-in) direction=in ;;
         -selection|-sel) shift; (($#)) || die 'missing selection'; selection=$1 ;;
@@ -262,7 +286,7 @@ while (($#)); do
         -loops|-l) shift; (($#)) || die 'missing loop count' ;;
         -h|-help|--help)
             printf 'Usage: xclip [-in|-out] [-selection clipboard] [-target TARGET] [FILE...]\n'
-            printf 'Run xclip --watch to bridge the Windows clipboard to Linux graphical applications.\n'
+            printf 'Run xclip --watch-files-out to publish Linux file URIs to the Windows clipboard.\n'
             printf 'Targets: UTF8_STRING, STRING, TEXT, text/plain, text/plain;charset=utf-8, image/png, TARGETS, text/uri-list\n'
             exit 0 ;;
         -version|--version) printf 'xclip WSL bridge 2.1\n'; exit 0 ;;
@@ -349,116 +373,93 @@ copy_files() {
     keep_copy=true
 }
 
+if [[ $watch_mode == true ]]; then
+    native="$HOME/.local/lib/xclip-x11/usr/bin/xclip"
+    [[ -x $native ]] || die 'native X11 xclip is missing from ~/.local/lib/xclip-x11'
+    lock_name=files-out
+    lock_dir="${XDG_RUNTIME_DIR:-$HOME/.cache}/xclip-bridge-$lock_name"
+    mkdir -p -m 700 -- "$lock_dir"
+    exec 9> "$lock_dir/lock"
+    flock -n 9 || die 'a clipboard bridge is already running'
+    if [[ $watch_files_out != true ]]; then die 'unsupported watch mode'; fi
+    # Resolve and publish only Linux file URIs; never sample the Windows clipboard.
+    powershell=$(command -v powershell.exe || true)
+    if [[ -z $powershell ]]; then powershell=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe; fi
+    [[ -x $powershell ]] || die 'Windows PowerShell executable is unavailable'
+    watch_script=$(cat <<'WATCH_POWERSHELL'
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+$utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+$paths = New-Object System.Collections.Specialized.StringCollection
+while (($line = [Console]::ReadLine()) -ne $null) {
+    if ($line.Length -gt 0) {
+        [void]$paths.Add($utf8.GetString([Convert]::FromBase64String($line)))
+    }
+}
+if ($paths.Count -eq 0) { throw 'empty file list' }
+for ($attempt = 0; $attempt -lt 5; $attempt++) {
+    try { [System.Windows.Forms.Clipboard]::SetFileDropList($paths); exit 0 }
+    catch [System.Runtime.InteropServices.ExternalException] {
+        if ($attempt -eq 4) { throw }
+        Start-Sleep -Milliseconds 60
+    }
+}
+WATCH_POWERSHELL
+    )
+    encoded=$(printf '%s' "$watch_script" | iconv -f UTF-8 -t UTF-16LE | base64 -w 0)
+    last_uri_fingerprint=
+    while true; do
+        if ! "$native" -selection clipboard -target text/uri-list -o > "$work/uris" 2>/dev/null; then
+            last_uri_fingerprint=
+            sleep 0.25
+            continue
+        fi
+        tr -d '\r' < "$work/uris" > "$work/uris.normalized"
+        mapfile -t uris < <(sed '/^[[:space:]]*$/d' "$work/uris.normalized")
+        ((${#uris[@]})) || { sleep 0.25; continue; }
+        uri_fingerprint=$(sha256sum "$work/uris.normalized")
+        [[ $uri_fingerprint == "$last_uri_fingerprint" ]] && { sleep 0.25; continue; }
+        : > "$work/windows-paths.b64"
+        valid_count=0
+        for uri in "${uris[@]}"; do
+            [[ $uri == file:///* ]] || { valid_count=0; break; }
+            linux_path=${uri#file://}
+            decoded_path=
+            LC_ALL=C
+            for ((i=0; i<${#linux_path}; i++)); do
+                char=${linux_path:i:1}
+                if [[ $char == % && ${#linux_path} -ge $((i + 3)) ]]; then
+                    hex=${linux_path:i+1:2}
+                    [[ $hex =~ ^[0-9A-Fa-f]{2}$ ]] || { decoded_path+=$char; continue; }
+                    printf -v byte '\\x%s' "$hex"
+                    printf -v byte '%b' "$byte"
+                    decoded_path+=$byte
+                    i=$((i + 2))
+                else
+                    decoded_path+=$char
+                fi
+            done
+            [[ $decoded_path == /mnt/* || $decoded_path == /tmp/chatgpt-clipboard.* ]] && { valid_count=0; break; }
+            [[ -f $decoded_path || -d $decoded_path ]] || { valid_count=0; break; }
+            windows_path=$(wslpath -w -- "$decoded_path") || { valid_count=0; break; }
+            printf '%s' "$windows_path" | base64 -w 0 >> "$work/windows-paths.b64"
+            printf '\n' >> "$work/windows-paths.b64"
+            valid_count=$((valid_count + 1))
+        done
+        if ((valid_count > 0)); then
+            timeout 20s "$powershell" -NoLogo -NoProfile -NonInteractive -STA \
+                -EncodedCommand "$encoded" < "$work/windows-paths.b64" ||
+                printf 'xclip bridge: Linux file publish failed; waiting for next clipboard change\n' >&2
+        fi
+        last_uri_fingerprint=$uri_fingerprint
+        sleep 0.25
+    done
+fi
+
 # Services may have a minimal PATH without WSL interop directories.
 powershell=$(command -v powershell.exe || true)
 if [[ -z $powershell ]]; then powershell=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe; fi
 [[ -x $powershell ]] || die 'Windows PowerShell executable is unavailable'
-
-if [[ $watch_mode == true ]]; then
-    native="$HOME/.local/lib/xclip-x11/usr/bin/xclip"
-    [[ -x $native ]] || die 'native X11 xclip is missing from ~/.local/lib/xclip-x11'
-    lock_dir="${XDG_RUNTIME_DIR:-$HOME/.cache}/xclip-bridge"
-    mkdir -p -m 700 -- "$lock_dir"
-    exec 9> "$lock_dir/lock"
-    flock -n 9 || die 'a clipboard bridge is already running'
-    watch_script=$(cat <<'WATCH_POWERSHELL'
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ClipboardSequence { [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber(); [DllImport("user32.dll")] public static extern IntPtr GetClipboardOwner(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p); }'
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-$previous = -1L
-while ($true) {
-    $sequence = [ClipboardSequence]::GetClipboardSequenceNumber()
-    if ($sequence -ne $previous) {
-        try {
-            [uint32]$ownerPid = 0
-            [void][ClipboardSequence]::GetWindowThreadProcessId([ClipboardSequence]::GetClipboardOwner(), [ref]$ownerPid)
-            if ($ownerPid -ne 0) {
-                $owner = (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue).ProcessName
-                # WSLg republishes Linux selections through its RDP client.
-                # Ignore that echo so PNG selections remain PNG selections.
-                if ($owner -eq 'msrdc' -or $owner -eq 'mstsc') {
-                    $previous = $sequence
-                    Start-Sleep -Milliseconds 150
-                    continue
-                }
-            }
-            $data = [System.Windows.Forms.Clipboard]::GetDataObject()
-            $frame = 'TEXT '
-            if ($null -ne $data -and $data.GetDataPresent('Bitmap')) {
-                $image = $data.GetData('Bitmap')
-                $stream = New-Object System.IO.MemoryStream
-                try {
-                    $image.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-                    $frame = 'IMAGE ' + [Convert]::ToBase64String($stream.ToArray())
-                } finally { $stream.Dispose(); $image.Dispose() }
-            } elseif ($null -ne $data -and $data.GetDataPresent('FileDrop')) {
-                $paths = @($data.GetData('FileDrop') | ForEach-Object { [Convert]::ToBase64String($utf8.GetBytes([string]$_)) })
-                $frame = 'FILES ' + ($paths -join ' ')
-            } elseif ($null -ne $data -and $data.GetDataPresent('UnicodeText')) {
-                $text = ([string]$data.GetData('UnicodeText')).Replace("`r`n", "`n").Replace("`r", "`n")
-                $frame = 'TEXT ' + [Convert]::ToBase64String($utf8.GetBytes($text))
-            }
-            if ($null -ne $frame -and [ClipboardSequence]::GetClipboardSequenceNumber() -eq $sequence) {
-                [Console]::WriteLine($frame)
-                [Console]::Out.Flush()
-                $previous = $sequence
-            }
-        } catch {
-            [Console]::Error.WriteLine('clipboard watch: ' + $_.Exception.Message)
-        }
-    }
-    Start-Sleep -Milliseconds 150
-}
-WATCH_POWERSHELL
-)
-    encoded=$(printf '%s' "$watch_script" | iconv -f UTF-8 -t UTF-16LE | base64 -w 0)
-    mkfifo "$work/events"
-    "$powershell" -NoLogo -NoProfile -NonInteractive -STA -EncodedCommand "$encoded" > "$work/events" < /dev/null &
-    producer=$!
-    last_source=
-    last_published=
-    while IFS=' ' read -r frame_type payload; do
-        payload=${payload%$'\r'}
-        source_hash=$(printf '%s %s' "$frame_type" "$payload" | sha256sum)
-        # A new FileDrop event may contain changed files at the same paths.
-        [[ $frame_type == FILES || $source_hash != "$last_source" ]] || continue
-        case "$frame_type" in
-            IMAGE) mime=image/png; printf '%s' "$payload" | base64 -d > "$work/payload" ;;
-            TEXT) mime=UTF8_STRING; printf '%s' "$payload" | base64 -d > "$work/payload" ;;
-            FILES)
-                mime=UTF8_STRING
-                kind=text
-                read -r -a encoded_paths <<< "$payload"
-                printf '%s\n' "${encoded_paths[@]}" > "$work/file-paths"
-                exec 3< "$work/file-paths"
-                # Isolate per-event failures while cleaning incomplete copies.
-                if ! (
-                    trap cleanup_copy EXIT
-                    copy_files
-                ) > "$work/payload"; then
-                    exec 3<&-
-                    printf 'xclip bridge: file copy failed; waiting for the next clipboard event\n' >&2
-                    continue
-                fi
-                exec 3<&-
-                ;;
-            *) die 'invalid clipboard watch frame' ;;
-        esac
-        fingerprint="$mime $(sha256sum "$work/payload")"
-        if [[ $fingerprint != "$last_published" ]]; then
-            "$native" -selection clipboard -target "$mime" -i "$work/payload" 9>&-
-            last_published=$fingerprint
-            printf 'xclip bridge: published %s (%s bytes)\n' "$frame_type" "$(wc -c < "$work/payload")" >&2
-        fi
-        last_source=$source_hash
-        copy_root=
-        keep_copy=false
-    done < "$work/events"
-    die 'clipboard monitor stopped'
-fi
 
 ps_script=$(cat <<'POWERSHELL'
 $ErrorActionPreference = 'Stop'
@@ -578,31 +579,364 @@ XCLIP_SOURCE
     /usr/local/bin/xclip --version
 }
 
+install_file_session() {
+    local lib="$HOME/.local/lib/wsl-clipboard-session"
+    cat > "$TEMP_DIR/session.cpp" <<'SESSION_CPP'
+#include <QtGui>
+#include <memory>
+
+static QString mapPath(QString flag, QString path) {
+    QProcess proc;
+    proc.start("wslpath", {flag, "--", path});
+    if (!proc.waitForFinished() || proc.exitCode()) return {};
+    QByteArray bytes = proc.readAllStandardOutput();
+    if (bytes.endsWith('\n')) bytes.chop(1);
+    return QString::fromUtf8(bytes);
+}
+
+static QByteArray offer(const QMimeData *data, QByteArray seq) {
+    if (!data) return {};
+    QList<QUrl> urls = data->urls();
+    if (urls.isEmpty() && data->hasFormat("x-special/gnome-copied-files")) {
+        auto lines = data->data("x-special/gnome-copied-files").split('\n');
+        const auto action = lines.takeFirst().trimmed();
+        if (action != "copy" && action != "cut") return {};
+        for (const auto &line : lines)
+            if (!line.trimmed().isEmpty()) urls << QUrl::fromEncoded(line.trimmed(), QUrl::StrictMode);
+    }
+    if (!urls.isEmpty()) {
+        QByteArray result = "FILES " + seq;
+        for (const auto &url : urls) {
+            if (!url.isLocalFile() || !QFileInfo::exists(url.toLocalFile())) return {};
+            QString path = mapPath("-w", url.toLocalFile());
+            if (path.isEmpty()) return {};
+            result += " " + path.toUtf8().toBase64();
+        }
+        return result;
+    }
+    if (data->hasImage()) {
+        QBuffer png;
+        png.open(QIODevice::WriteOnly);
+        if (!qvariant_cast<QImage>(data->imageData()).save(&png, "PNG")) return {};
+        return "IMAGE " + seq + " " + png.data().toBase64();
+    }
+    if (data->hasText()) return "TEXT " + seq + " " + data->text().toUtf8().toBase64();
+    return {};
+}
+
+static bool stageFiles(QMimeData &data, QTemporaryDir &dir, const QList<QByteArray> &paths) {
+    QList<QUrl> urls;
+    QStringList names;
+    for (const auto &encoded : paths) {
+        QString path = mapPath("-u", QString::fromUtf8(QByteArray::fromBase64(encoded)));
+        QFileInfo info(path);
+        QString subdir = dir.filePath(QString::number(urls.size() + 1));
+        if (!info.isAbsolute() || info.fileName().isEmpty() || info.fileName() == "." ||
+            info.fileName() == ".." || info.isSymLink() ||
+            !(info.isFile() || info.isDir()) || !QDir().mkdir(subdir) ||
+            QProcess::execute("cp", {"-R", "-P", "--", path, subdir + "/"}) != 0) return false;
+        names << subdir + "/" + info.fileName();
+        urls << QUrl::fromLocalFile(names.last());
+    }
+    data.setUrls(urls);
+    data.setText(names.join('\n'));
+    QByteArray gnomeFiles = "copy";
+    for (const auto &url : urls) gnomeFiles += "\n" + url.toEncoded();
+    data.setData("x-special/gnome-copied-files", gnomeFiles);
+    return !urls.isEmpty();
+}
+
+int main(int argc, char **argv) {
+    QGuiApplication app(argc, argv);
+    if (argc != 3) return 2;
+    QFile script(argv[2]);
+    if (!script.open(QIODevice::ReadOnly)) return 1;
+    QString src = QString::fromUtf8(script.readAll());
+    QByteArray encoded(reinterpret_cast<const char *>(src.utf16()), src.size()*2);
+    QProcess host;
+    host.setProcessChannelMode(QProcess::ForwardedErrorChannel);
+    host.start(argv[1], {"-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", encoded.toBase64()});
+    if (!host.waitForStarted()) return 1;
+    auto exchange = [&](QByteArray request) -> QList<QByteArray> {
+        if (host.write(request + '\n') < 0) {
+            qCritical("Windows clipboard helper stopped");
+            app.exit(1);
+            return {"ERROR"};
+        }
+        while (!host.canReadLine()) {
+            if (!host.waitForReadyRead(30000)) {
+                qCritical("Windows clipboard helper did not respond");
+                app.exit(1);
+                return {"ERROR"};
+            }
+        }
+        return host.readLine().trimmed().split(' ');
+    };
+    auto clipboard = app.clipboard();
+    QByteArray seq = "-1";
+    bool dirty = false, importing = false;
+    QObject::connect(clipboard, &QClipboard::dataChanged, [&] {
+        if (!importing && !clipboard->ownsClipboard()) dirty = true;
+    });
+    QTimer timer;
+    QObject::connect(&timer, &QTimer::timeout, [&] {
+        if (dirty && seq != "-1") {
+            dirty = false;
+            QByteArray request = offer(clipboard->mimeData(), seq);
+            if (!request.isEmpty()) {
+                auto reply = exchange(request);
+                if (reply.first() == "OK") { seq = reply.value(1); return; }
+                if (reply.first() == "ERROR") { dirty = true; return; }
+            }
+        }
+        auto frame = exchange("READ " + seq);
+        auto type = frame.first(), version = frame.value(1);
+        if (type == "SAME" || type == "ERROR" || type == "CHANGED") return;
+        auto data = std::make_unique<QMimeData>();
+        std::unique_ptr<QTemporaryDir> staging;
+        if (type == "FILES") {
+            staging = std::make_unique<QTemporaryDir>("/tmp/chatgpt-clipboard.XXXXXXXX");
+            if (!staging->isValid() || !stageFiles(*data, *staging, frame.mid(2))) {
+                qWarning("Could not stage the complete file selection");
+                data = std::make_unique<QMimeData>();
+                staging.reset();
+            }
+        } else if (type == "TEXT") {
+            QString text = QString::fromUtf8(QByteArray::fromBase64(frame.value(2)));
+            data->setText(text.replace("\r\n", "\n").replace('\r', '\n'));
+        } else if (type == "IMAGE") {
+            auto image = QImage::fromData(QByteArray::fromBase64(frame.value(2)), "PNG");
+            if (!image.isNull()) data->setImageData(image);
+        } else if (type != "EMPTY") return;
+        if (exchange("CHECK " + version).first() != "CURRENT") return;
+        app.processEvents(QEventLoop::ExcludeUserInputEvents);
+        if (dirty && seq != "-1") return;
+        if (staging) staging->setAutoRemove(false);
+        importing = true;
+        clipboard->setMimeData(data.release());
+        importing = false;
+        dirty = false;
+        seq = version;
+    });
+    timer.start(250);
+    return app.exec();
+}
+SESSION_CPP
+    g++ -std=c++17 -O2 -fPIC "$TEMP_DIR/session.cpp" -o "$TEMP_DIR/session" $(pkg-config --cflags --libs Qt5Gui)
+    write_user_file "$lib/session" 755 < "$TEMP_DIR/session"
+    write_user_file "$lib/backend.ps1" 600 <<'SESSION_PS'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ClipVersion {
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr window);
+    [DllImport("user32.dll")] static extern bool CloseClipboard();
+    [DllImport("user32.dll")] static extern bool EmptyClipboard();
+    [DllImport("user32.dll")] static extern IntPtr SetClipboardData(uint format, IntPtr memory);
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalAlloc(uint flags, UIntPtr size);
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr memory);
+    [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr memory);
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalFree(IntPtr memory);
+    public static string Publish(IntPtr window, uint expected, uint[] formats, byte[][] data) {
+        IntPtr[] handles = new IntPtr[data.Length];
+        bool opened = false;
+        try {
+            for (int i = 0; i < data.Length; i++) {
+                handles[i] = GlobalAlloc(2, new UIntPtr((uint)data[i].Length));
+                IntPtr ptr = GlobalLock(handles[i]);
+                if (ptr == IntPtr.Zero) return "ERROR";
+                try { Marshal.Copy(data[i], 0, ptr, data[i].Length); }
+                finally { GlobalUnlock(handles[i]); }
+            }
+            opened = OpenClipboard(window);
+            if (!opened) return "ERROR";
+            if (GetClipboardSequenceNumber() != expected) return "CHANGED";
+            if (!EmptyClipboard()) return "ERROR";
+            for (int i = 0; i < formats.Length; i++) {
+                if (SetClipboardData(formats[i], handles[i]) == IntPtr.Zero) return "ERROR";
+                handles[i] = IntPtr.Zero;
+            }
+            return "OK " + GetClipboardSequenceNumber();
+        } finally {
+            if (opened) CloseClipboard();
+            foreach (IntPtr h in handles) if (h != IntPtr.Zero) GlobalFree(h);
+        }
+    }
+}
+'@
+$window = New-Object Windows.Forms.Control
+$mutex = [Threading.Mutex]::new($false, 'Local\NorthwindWSLClipboardSession')
+try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
+if (!$owned) { throw 'Another WSL file session is running' }
+$utf8 = New-Object Text.UTF8Encoding($false, $true)
+function Encode([string]$value) { [Convert]::ToBase64String($utf8.GetBytes($value)) }
+function Decode([string]$value) { $utf8.GetString([Convert]::FromBase64String($value)) }
+function Exchange([string]$request) {
+    $parts = $request.Split(' ')
+    $sequence = [ClipVersion]::GetClipboardSequenceNumber()
+    if ($parts[0] -eq "CHECK") { if ($parts[1] -eq [string]$sequence) { return "CURRENT" }; return "CHANGED" }
+    if ($parts[0] -eq 'READ') {
+        if ($parts[1] -eq [string]$sequence) { return "SAME $sequence" }
+        $data = [Windows.Forms.Clipboard]::GetDataObject()
+        $reply = "EMPTY $sequence"
+        if ($data -and $data.GetDataPresent('FileDrop')) {
+            $paths = @(foreach ($path in $data.GetData('FileDrop')) { Encode $path })
+            $reply = "FILES $sequence " + ($paths -join ' ')
+        } elseif ($data -and $data.GetDataPresent('PNG', $false)) {
+            $stream = $data.GetData('PNG', $false)
+            $reply = "IMAGE $sequence " + [Convert]::ToBase64String($stream.ToArray())
+        } elseif ($data -and $data.GetDataPresent('Bitmap')) {
+            $image = $data.GetData('Bitmap')
+            $stream = New-Object IO.MemoryStream
+            try {
+                $image.Save($stream, [Drawing.Imaging.ImageFormat]::Png)
+                $reply = "IMAGE $sequence " + [Convert]::ToBase64String($stream.ToArray())
+            } finally { $stream.Dispose(); $image.Dispose() }
+        } elseif ($data -and $data.GetDataPresent('UnicodeText')) {
+            $reply = "TEXT $sequence " + (Encode ([string]$data.GetData('UnicodeText')))
+        }
+        if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
+        return $reply
+    }
+    if ($parts[1] -ne [string]$sequence) { return 'CHANGED' }
+    $formats = [Collections.Generic.List[uint32]]::new()
+    $payloads = [Collections.Generic.List[byte[]]]::new()
+    switch ($parts[0]) {
+        FILES {
+            $paths = New-Object Collections.Specialized.StringCollection
+            for ($i=2; $i -lt $parts.Length; $i++) { [void]$paths.Add((Decode $parts[$i])) }
+            # DROPFILES followed by double-NUL-terminated UTF-16 paths.
+            $header = New-Object byte[] 20
+            $header[0] = 20
+            $header[16] = 1
+            $payloads.Add([byte[]]($header + [Text.Encoding]::Unicode.GetBytes(($paths -join [char]0) + [char]0 + [char]0)))
+            $formats.Add(15)
+        }
+        TEXT {
+            $text = (Decode $parts[2]).Replace("`r`n", "`n").Replace("`n", "`r`n")
+            $payloads.Add([Text.Encoding]::Unicode.GetBytes($text + [char]0))
+            $formats.Add(13)
+        }
+        IMAGE {
+            $png = New-Object IO.MemoryStream(,[Convert]::FromBase64String($parts[2]))
+            $bitmap = [Drawing.Image]::FromStream($png)
+            $bmp = [IO.MemoryStream]::new()
+            try {
+                $bitmap.Save($bmp, [Drawing.Imaging.ImageFormat]::Bmp)
+                $bmp.Position = 14
+                $dib = New-Object byte[] ($bmp.Length - 14)
+                $null = $bmp.Read($dib, 0, $dib.Length)
+                $payloads.Add($png.ToArray())
+                $formats.Add([Windows.Forms.DataFormats]::GetFormat('PNG').Id)
+                $payloads.Add($dib)
+                $formats.Add(8)
+            } finally { $bitmap.Dispose(); $bmp.Dispose(); $png.Dispose() }
+        }
+        default { throw 'unsupported clipboard type' }
+    }
+    return [ClipVersion]::Publish($window.Handle, $sequence, $formats.ToArray(), $payloads.ToArray())
+}
+while ($null -ne ($request = [Console]::ReadLine())) {
+    try { $reply = Exchange $request } catch { $reply = 'ERROR' }
+    [Console]::WriteLine($reply)
+    [Console]::Out.Flush()
+}
+SESSION_PS
+    write_user_file "$HOME/.local/bin/wsl-clipboard-app" 755 <<'SESSION_LAUNCH'
+#!/bin/bash
+set -euo pipefail
+umask 077
+if (($# == 0)); then echo '用法: wsl-clipboard-app <前台 X11 图形程序> [参数...]' >&2; exit 2; fi
+lib="$HOME/.local/lib/wsl-clipboard-session"
+state=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/clipboard-session.XXXXXXXX")
+pids=()
+cleanup() {
+    for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || :; done
+    wait || :
+    rm -rf -- "$state"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+display=
+for number in {90..199}; do
+    if [[ ! -e /tmp/.X11-unix/X$number && ! -e /tmp/.X${number}-lock ]]; then display=:$number; break; fi
+done
+[[ -n $display ]] || { echo '没有空闲 X11 显示号' >&2; exit 1; }
+touch "$state/auth"
+xauth -f "$state/auth" add "$display" . "$(mcookie)"
+Xephyr "$display" -noreset -auth "$state/auth" -nolisten tcp -resizeable -screen 1100x760 -title 'WSL 双向剪贴板' &
+server=$!
+pids+=("$server")
+export DISPLAY=$display XAUTHORITY="$state/auth" QT_QPA_PLATFORM=xcb GDK_BACKEND=x11
+unset WAYLAND_DISPLAY
+for _ in {1..20}; do
+    kill -0 "$server" || exit 1
+    if timeout 1 xdpyinfo >/dev/null 2>&1; then break; fi
+    sleep .05
+done
+timeout 3 xdpyinfo >/dev/null
+psbin=$(command -v powershell.exe || true)
+[[ -x $psbin ]] || psbin=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+"$lib/session" "$psbin" "$lib/backend.ps1" &
+bridge=$!
+pids+=("$bridge")
+openbox &
+pids+=("$!")
+# A private bus keeps toolkit single-instance forwarding and input contexts in this display.
+dbus-run-session -- bash -c '
+    if command -v fcitx5 >/dev/null; then
+        export GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx
+        fcitx5 --disable=wayland >/dev/null 2>&1 &
+        im=$!
+        trap '\''kill "$im" 2>/dev/null || : '\'' EXIT
+    fi
+    "$@"
+' bash "$@" &
+client=$!
+pids+=("$client")
+wait -n -p finished "$server" "$bridge" "$client"
+[[ $finished == "$client" ]]
+SESSION_LAUNCH
+}
+
 configure_services() {
     STEP=后台服务
     write_user_file "$HOME/.local/bin/xclip-bridge-start" 755 <<'START'
 #!/bin/bash
 set -euo pipefail
+mode=${1:-}
+case "$mode" in
+    files-out) watch_args=(--watch-files-out) ;;
+    *) printf '未知剪贴板模式: %s\n' "$mode" >&2; exit 2 ;;
+esac
 for socket in /run/WSL/1_interop /run/WSL/*_interop; do
     if [[ -S $socket ]]; then
         export WSL_INTEROP="$socket"
-        exec /usr/local/bin/xclip --watch
+        exec /usr/local/bin/xclip "${watch_args[@]}"
     fi
 done
 printf '未找到 WSL 互操作 socket\n' >&2
 exit 1
 START
-    write_user_file "$CONFIG_DIR/systemd/user/xclip-bridge.service" 644 <<SERVICE
+    local service_dir="$CONFIG_DIR/systemd/user"
+    write_user_file "$service_dir/xclip-linux-files-bridge.service" 644 <<SERVICE
 [Unit]
-Description=Windows to WSL clipboard bridge
+Description=WSL Linux file clipboard publisher
 StartLimitIntervalSec=0
 [Service]
 Type=simple
-ExecStart=/bin/bash %h/.local/bin/xclip-bridge-start
+ExecStart=/bin/bash %h/.local/bin/xclip-bridge-start files-out
 Environment="DISPLAY=$DISPLAY"
 Environment="WSL_DISTRO_NAME=$WSL_DISTRO_NAME"
 Restart=on-failure
 RestartSec=3
+SuccessExitStatus=143
 KillMode=control-group
 TimeoutStopSec=5
 UMask=0077
@@ -627,17 +961,29 @@ WantedBy=default.target
 SERVICE
     fi
     user_systemctl daemon-reload
-    user_systemctl enable xclip-bridge.service
-    # A manually started watch process owns the same lock and must be stopped by its terminal.
-    user_systemctl restart xclip-bridge.service
+    local legacy
+    for legacy in xclip-bridge.service xclip-files-bridge.service; do
+        if [[ $(user_systemctl show -p LoadState --value "$legacy") != not-found ]]; then
+            user_systemctl disable --now "$legacy"
+        fi
+    done
+    user_systemctl disable --now xclip-linux-files-bridge.service
+    case "$CLIPBOARD_MODE" in
+        files-out)
+            user_systemctl enable --now xclip-linux-files-bridge.service
+            ;;
+        native|session) ;;
+    esac
     if [[ $INSTALL_CHINESE == true ]]; then
         user_systemctl enable wsl-fcitx5.service
         user_systemctl restart wsl-fcitx5.service
+    else
+        user_systemctl disable --now wsl-fcitx5.service >/dev/null 2>&1 || true
     fi
-    sleep 3
-    if ! user_systemctl is-active --quiet xclip-bridge.service; then
-        journalctl --user -u xclip-bridge.service -n 20 --no-pager
-        fail '桥接未持续运行。若另一个终端正在运行 xclip --watch，请在该终端按 Ctrl+C 后重试。'
+    if [[ $CLIPBOARD_MODE != native ]]; then sleep 3; fi
+    if [[ $CLIPBOARD_MODE == files-out ]] && ! user_systemctl is-active --quiet xclip-linux-files-bridge.service; then
+        journalctl --user -u xclip-linux-files-bridge.service -n 20 --no-pager
+        fail 'Linux 到 Windows 文件增强未持续运行。'
     fi
     if [[ $INSTALL_CHINESE == true ]] && ! user_systemctl is-active --quiet wsl-fcitx5.service; then
         journalctl --user -u wsl-fcitx5.service -n 20 --no-pager
@@ -650,7 +996,8 @@ main() {
     if [[ $DRY_RUN == true ]]; then
         printf '计划安装中文环境=%s，系统升级=%s\n' \
             "$([[ $INSTALL_CHINESE == true ]] && echo 是 || echo 否)" "$UPGRADE"
-        printf '将安装 xclip 包、内嵌桥接源码、原生辅助程序、用户服务及自动启动。\n'
+        printf '剪贴板模式=%s（native=仅WSLg原生；files-out=Linux到Windows文件增强；session=独立窗口双向剪贴板）\n' "$CLIPBOARD_MODE"
+        printf '将安装 xclip 包和内嵌桥接源码；自动停止旧全量桥接，再按模式启用服务。\n'
         printf '已有配置备份至 ~/.local/state/wsl-ai-setup/backups。\n'
         return
     fi
@@ -660,6 +1007,7 @@ main() {
     configure_wsl
     if [[ $INSTALL_CHINESE == true ]]; then configure_chinese; fi
     install_clipboard
+    if [[ $CLIPBOARD_MODE == session ]]; then install_file_session; fi
     configure_services
     STEP=完成
     log "配置备份位于 $BACKUP_DIR"
@@ -667,8 +1015,12 @@ main() {
     if [[ $INSTALL_CHINESE == true ]]; then
         printf '\n请重新进入 WSL 用户会话，让中文与输入法环境变量生效。\n'
     fi
-    printf '验证 Windows 文本、截图和文件在主聊天输入框的 Ctrl+V。\n'
-    printf '开机后进入该 WSL 用户会话时，systemd 自动启动桥接；重启后的实际粘贴仍需验收。\n'
+    if [[ $CLIPBOARD_MODE == session ]]; then
+        printf '启动双向剪贴板窗口：~/.local/bin/wsl-clipboard-app 程序名 [参数...]\n'
+    else
+        printf '普通 WSLg 窗口使用原生剪贴板。双向文件粘贴可选 --file-session。\n'
+    fi
+    printf '开机后进入该 WSL 用户会话时，systemd 按所选模式启动服务；重启后的实际粘贴仍需验收。\n'
 }
 
 main "$@"

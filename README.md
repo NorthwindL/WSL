@@ -5,14 +5,24 @@ WSL 中文的粘贴、复制、文件及截图，与windows 主机的互操作�
 在目标主机的 Debian / Ubuntu WSLg 普通用户终端中执行。
 
 ```bash
-curl -fL --retry 3 https://raw.githubusercontent.com/9848987/WSL/main/install.sh -o /tmp/wsl-ai-install.sh && bash /tmp/wsl-ai-install.sh
+curl -fL --retry 3 https://raw.githubusercontent.com/NorthwindL/WSL/main/install.sh -o /tmp/wsl-ai-install.sh && bash /tmp/wsl-ai-install.sh
 ```
 
-安装时按终端提示输入该 Linux 用户的 sudo 密码。此前手动运行了 `xclip --watch` 时，先在对应终端按 Ctrl+C 结束该进程，再运行安装命令。
+安装时按终端提示输入该 Linux 用户的 sudo 密码。新版安装会停止并禁用旧的 `xclip-bridge.service`；若旧版桥接曾在终端手动运行，请先在对应终端按 Ctrl+C 结束。
 
-`install.sh` 是自包含脚本，已内嵌完整剪贴板桥接源码，下载单个文件即可运行。默认安装文本、截图、文件及文件夹剪贴板桥接和自动启动。
+`install.sh` 是自包含脚本。默认安装中文环境，普通 WSLg 窗口继续使用原生剪贴板。本机 Ubuntu 24.04 实测中，资源管理器复制文件后，普通 X11 窗口没有收到文件 URI。需要双向文件和截图粘贴时，选择下面的独立窗口模式。
 
-安装使用 `--no-install-recommends`，由 APT 解析必需依赖。默认仅更新 APT 软件索引并安装所需组件。中文字体和输入法通过 `--with-chinese` 选装，系统软件升级通过 `--upgrade` 显式执行。
+### 双向文件、图片和文字粘贴
+
+运行 `bash install.sh --file-session`，然后用 `~/.local/bin/wsl-clipboard-app 程序名 [参数...]` 启动需要粘贴的 X11 应用。例如已安装 Mousepad 时可运行 `~/.local/bin/wsl-clipboard-app mousepad --disable-server`。需要前台运行的应用实例，支持单实例转发的程序请使用其独立实例选项。安装器会为此模式安装 Xephyr、Openbox、Qt5 开发包及编译器，现场构建与本机架构匹配的辅助程序。
+
+Windows 复制文件或目录后，窗口中的文件管理器获得 `text/uri-list`，文本框可粘贴 Linux 副本的路径。副本保存在权限为 0700 的 `/tmp/chatgpt-clipboard.*` 目录，各次复制独立暂存。等待文件复制结束再粘贴，使用完可删除对应暂存目录。反向复制时，Windows 收到标准文件列表，接收程序通过 WSL 共享路径读取内容，读取期间需保持发行版运行和源文件可访问。此模式通过文件系统传输内容，剪贴板仅携带路径。文本和 PNG 图片通过独立窗口自己的剪贴板传递。
+
+同一 Windows 登录会话同一时间可运行一个增强窗口。关闭前台应用即可结束本次桥接。回到普通 WSLg 窗口可继续使用原生模式。如果其他发行版仍运行旧的全量桥接，需要在对应发行版检查其服务。
+
+重复运行新版安装器时，会停止并禁用旧版 `xclip-bridge.service` 全量监听服务，避免其持续读取和重发布 Windows 剪贴板。可选的 `--with-files` 只监听 Linux X11 剪贴板中的 `text/uri-list` 并向 Windows 发布文件列表，不读取 Windows 剪贴板。
+
+安装使用 `--no-install-recommends`，由 APT 解析必需依赖。默认仅更新 APT 软件索引并安装所需组件。中文字体和输入法默认安装，可用 `--without-chinese` 跳过；系统软件升级通过 `--upgrade` 显式执行。
 
 精简模式的直接依赖为 `xclip`、`dbus-user-session`、`systemd`、`systemd-sysv`、`coreutils`、`util-linux`、`libc-bin` 和 `diffutils`。WSL 通常已具备其中的大部分基础组件，实际新增包以本机 APT 解析结果为准。X11 库随 `xclip` 的必需依赖安装。
 
@@ -20,12 +30,11 @@ curl -fL --retry 3 https://raw.githubusercontent.com/9848987/WSL/main/install.sh
 
 | 内容 | 设置结果 |
 |---|---|
-| 中文字体和语言（选装） | 使用 --with-chinese 安装 Noto CJK、文泉驿字体，生成 zh_CN.UTF-8，设置系统默认 LANG |
-| Fcitx5（选装） | 使用 --with-chinese 安装中文输入法和 GTK3 / Qt5 模块，新用户配置默认拼音，配置用户级后台服务 |
-| 纯文本剪贴板 | UTF-8 传输，CRLF / CR 换行转换为 LF |
-| Windows 截图 | 常驻桥接读取 Bitmap，转换 PNG，向同一 DISPLAY 的 X11 剪贴板发布 |
-| 文件及文件夹 | 复制实体至 Linux /tmp/chatgpt-clipboard.随机串/序号/原名称，再向输入框发布副本路径 |
-| 自动启动 | 配置 xclip-bridge.service，选装输入法时另配置 wsl-fcitx5.service，随该 WSL 用户服务管理器启动 |
+| 中文字体和语言 | 默认安装 Noto CJK、文泉驿字体，生成 zh_CN.UTF-8 并设置系统默认 LANG |
+| Fcitx5 | 默认安装中文输入法和 GTK3 / Qt5 模块，新用户配置默认拼音并配置用户级后台服务 |
+| Windows 文本和图片 | 由 WSLg 原生剪贴板同步处理，不启用自定义轮询重发布 |
+| WSLg → Windows 文件（可选） | 用 `--with-files` 监听 Linux 的 `text/uri-list`，发布 Windows 文件列表；不把 `/mnt` 或桥接临时副本回传 |
+| 自动启动 | 默认不启动剪贴板服务；启用文件增强时只启动 Linux→Windows 文件服务；中文输入法使用独立用户服务 |
 
 脚本适用于 Debian / Ubuntu 的 WSLg X11 环境，DISPLAY 形如 `:0`。原生 X11 组件由发行版软件仓库按当前系统架构安装。
 
@@ -37,11 +46,14 @@ curl -fL --retry 3 https://raw.githubusercontent.com/9848987/WSL/main/install.sh
 # 查看计划
 bash /tmp/wsl-ai-install.sh --dry-run
 
-# 安装文本、截图、文件剪贴板和自启
+# 默认安装中文环境；剪贴板完全由 WSLg 原生同步处理
 bash /tmp/wsl-ai-install.sh
 
-# 额外安装中文字体和输入法
-bash /tmp/wsl-ai-install.sh --with-chinese
+# 可选：从 WSLg 复制 Linux 文件后粘贴到 Windows
+bash /tmp/wsl-ai-install.sh --with-files
+
+# 不安装中文环境
+bash /tmp/wsl-ai-install.sh --without-chinese
 
 # 显式执行系统软件升级
 bash /tmp/wsl-ai-install.sh --upgrade
@@ -52,13 +64,11 @@ bash /tmp/wsl-ai-install.sh --check
 
 ## 完成后的验证
 
-选装中文环境后，重新进入同一 WSL 用户会话，让语言和输入法环境生效。完全退出并重新打开需要中文输入的应用。新建的输入法配置包含英文键盘和拼音，可以通过 Fcitx5 配置工具调整。已有输入法 profile 会保留。
+安装中文环境后，重新进入同一 WSL 用户会话，让语言和输入法环境生效。完全退出并重新打开需要中文输入的应用。新建的输入法配置包含英文键盘和拼音，可以通过 Fcitx5 配置工具调整。已有输入法 profile 会保留。
 
-依次验证 Windows 复制中文多行文本、Win+Shift+S 截图、资源管理器复制一个小文件和一个小目录，在目标 WSL 内运行的主聊天输入框按 Ctrl+V。截图应显示图片附件，文件和目录应显示 `/tmp` 副本路径，目录实体应包含内容。
+在增强窗口内试用中文多行文本、Win+Shift+S 截图、资源管理器中的文件与目录。文件应能从粘贴目标实际打开，图片应保持为图片。再从窗口内的文件管理器复制文件到资源管理器，打开粘贴后的副本核对内容。`--with-files` 另提供普通 X11 窗口到 Windows 的单向文件增强。
 
-自动启动表示用户服务在该 WSL 用户会话启动时运行。重启电脑后，重新进入该 WSL 和同一 Linux 用户，再测试截图粘贴。首次启动成功仍需要实际重启验收。WSL 尚未启动时，Linux 内的服务会等待 WSL 启动。
-
-同一 Windows 主机此前出现两套桥接同时运行后截图失效的用户反馈，暂时停止其中一套并重启另一套后恢复，具体相互影响机制尚待核实。部署另一发行版时，应同时核对已有桥接的状态。不同主机的同名发行版分别安装和验证。
+剪贴板默认没有自动启动服务。只有使用 `--with-files` 时，用户服务才会在该 WSL 用户会话启动时运行。中文输入法用户服务独立管理。
 
 ## 服务管理
 
@@ -67,27 +77,24 @@ bash /tmp/wsl-ai-install.sh --check
 ```bash
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
 
-systemctl --user status xclip-bridge.service --no-pager -l
-systemctl --user restart xclip-bridge.service
-journalctl --user -u xclip-bridge.service -n 30 --no-pager
+systemctl --user status xclip-linux-files-bridge.service --no-pager -l
+journalctl --user -u xclip-linux-files-bridge.service -n 30 --no-pager
 
 # 停止并关闭自动启动
-systemctl --user disable --now xclip-bridge.service wsl-fcitx5.service
+systemctl --user disable --now xclip-linux-files-bridge.service wsl-fcitx5.service
 ```
 
 遇到 `Unit not found`，先确认当前主机、WSL 名称、Linux 用户和安装时相同，再重新执行安装脚本。
 
-遇到 `a clipboard bridge is already running`，先结束手动启动的 `xclip --watch`，再重启服务。通过服务启动的桥接应使用 systemctl 管理。
-
-前台排查可执行 `/usr/local/bin/xclip --watch`，保持终端打开并重新截图测试。排查完成按 Ctrl+C，再恢复后台服务。
+`--with-files` 服务仅在 Linux 剪贴板提供真实文件 URI 时更新 Windows 文件列表。普通文本路径不会被转换成文件。
 
 ## 配置保护与重复运行
 
-已有被修改文件备份到 `~/.local/state/wsl-ai-setup/backups/时间-进程号/`，备份按原绝对路径保存。安装进程通过锁串行执行。配置写入前检查当前内容，修改范围限于本方案管理的文件与配置段。重复运行会检查配置并重启用户服务。
+已有被修改文件备份到 `~/.local/state/wsl-ai-setup/backups/时间-进程号/`，备份按原绝对路径保存。安装进程通过锁串行执行。配置写入前检查当前内容，修改范围限于本方案管理的文件与配置段。重复运行会按所选模式停用旧桥接或启用可选文件服务。
 
 为整合原始操作步骤，脚本会移除 `.bashrc` / `.profile` 中原样的 `fcitx5 --disable=wayland -d --replace` 启动行和 `eval $(dbus-launch --sh-syntax)` 行，改由用户服务管理输入法。其他自定义 shell 内容保留，修改前会备份。
 
-成功复制的资料保留在 `/tmp`，系统清理临时目录后需重新复制。后台以剪贴板变化触发复制，源文件后续变化需要重新复制触发。每次新的文件复制事件都会重新获取源内容并生成独立副本。单次复制失败时清理半成品，后台继续处理后续剪贴板事件。
+Windows 虚拟文件对象（例如部分邮件客户端的附件）需要单独的 `IStream` 协议。当前支持磁盘上的文件和目录。
 
 ## 官方参考
 
