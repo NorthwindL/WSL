@@ -10,7 +10,17 @@ curl -fL --retry 3 https://raw.githubusercontent.com/NorthwindL/WSL/main/install
 
 安装时按终端提示输入该 Linux 用户的 sudo 密码。新版安装会停止并禁用旧的 `xclip-bridge.service`；若旧版桥接曾在终端手动运行，请先在对应终端按 Ctrl+C 结束。
 
-`install.sh` 是自包含脚本。默认安装中文环境，普通 WSLg 窗口继续使用原生剪贴板。本机 Ubuntu 24.04 实测中，资源管理器复制文件后，普通 X11 窗口没有收到文件 URI。需要双向文件和截图粘贴时，选择下面的独立窗口模式。
+`install.sh` 是自包含脚本。默认安装中文环境，并启用 `wsl-clipboard-desktop.service`，向普通 WSLg X11 窗口提供 Windows 剪贴板文本、PNG 和磁盘文件。可用 `--native` 选择仅使用 WSLg 自带剪贴板。
+
+### OpenCode 桌面版粘贴修复
+
+默认安装完成后，退出挂起的 OpenCode，直接运行 `ai.opencode` 或从普通桌面入口打开。应用使用普通 WSLg 显示。此前由本脚本生成的独立窗口桌面覆盖会恢复为软件包的直接启动入口，恢复前会备份。
+
+后台服务直接读取 Windows 剪贴板，并在普通 X11 显示提供本地数据。它过滤 RDP 客户端回传的剪贴板事件，避免把自己发布的数据再次导入。等待 Windows 辅助程序期间继续处理 X11 请求。默认模式需要 Qt5 和构建依赖。每个 Windows 登录会话使用一个普通桌面数据提供程序，其他发行版的旧全量桥接应停止以避免竞争。
+
+2026-11-19 在新建 Ubuntu 24.04.5 环境中直接启动 OpenCode 2.3.2，验证英文、中文、emoji 多行和 2.2 万字符文本粘贴，截图显示为可解码的图片附件。编辑器清空后保留的末尾空行仍可出现在读回文本中。样本未发送给模型。
+
+独立窗口仍可显式选择 `--opencode-session`，启动方式为 `~/.local/bin/wsl-opencode`。旧参数 `--opencode-wayland` 为其兼容别名。
 
 ### 双向文件、图片和文字粘贴
 
@@ -18,13 +28,13 @@ curl -fL --retry 3 https://raw.githubusercontent.com/NorthwindL/WSL/main/install
 
 Windows 复制文件或目录后，窗口中的文件管理器获得 `text/uri-list`，文本框可粘贴 Linux 副本的路径。副本保存在权限为 0700 的 `/tmp/chatgpt-clipboard.*` 目录，各次复制独立暂存。等待文件复制结束再粘贴，使用完可删除对应暂存目录。反向复制时，Windows 收到标准文件列表，接收程序通过 WSL 共享路径读取内容，读取期间需保持发行版运行和源文件可访问。此模式通过文件系统传输内容，剪贴板仅携带路径。文本和 PNG 图片通过独立窗口自己的剪贴板传递。
 
-同一 Windows 登录会话同一时间可运行一个增强窗口。关闭前台应用即可结束本次桥接。回到普通 WSLg 窗口可继续使用原生模式。如果其他发行版仍运行旧的全量桥接，需要在对应发行版检查其服务。
+同一 Windows 登录会话同一时间可运行一个增强窗口。关闭前台应用即可结束本次桥接。如果其他发行版仍运行旧的全量桥接，需要在对应发行版检查其服务。
 
 重复运行新版安装器时，会停止并禁用旧版 `xclip-bridge.service` 全量监听服务，避免其持续读取和重发布 Windows 剪贴板。可选的 `--with-files` 只监听 Linux X11 剪贴板中的 `text/uri-list` 并向 Windows 发布文件列表，不读取 Windows 剪贴板。
 
 安装使用 `--no-install-recommends`，由 APT 解析必需依赖。默认仅更新 APT 软件索引并安装所需组件。中文字体和输入法默认安装，可用 `--without-chinese` 跳过；系统软件升级通过 `--upgrade` 显式执行。
 
-精简模式的直接依赖为 `xclip`、`dbus-user-session`、`systemd`、`systemd-sysv`、`coreutils`、`util-linux`、`libc-bin` 和 `diffutils`。WSL 通常已具备其中的大部分基础组件，实际新增包以本机 APT 解析结果为准。X11 库随 `xclip` 的必需依赖安装。
+基础依赖为 `xclip`、`dbus-user-session`、`systemd`、`systemd-sysv`、`coreutils`、`util-linux`、`libc-bin` 和 `diffutils`。普通桌面数据提供程序额外需要 `g++`、`pkg-config`、`qtbase5-dev` 和 `procps`。实际新增包以本机 APT 解析结果为准。
 
 ## 安装内容
 
@@ -32,9 +42,9 @@ Windows 复制文件或目录后，窗口中的文件管理器获得 `text/uri-l
 |---|---|
 | 中文字体和语言 | 默认安装 Noto CJK、文泉驿字体，生成 zh_CN.UTF-8 并设置系统默认 LANG |
 | Fcitx5 | 默认安装中文输入法和 GTK3 / Qt5 模块，新用户配置默认拼音并配置用户级后台服务 |
-| Windows 文本和图片 | 由 WSLg 原生剪贴板同步处理，不启用自定义轮询重发布 |
+| Windows 文本和图片 | 默认由普通桌面数据提供程序读取并发布到当前 X11 显示，过滤 RDP 回传 |
 | WSLg → Windows 文件（可选） | 用 `--with-files` 监听 Linux 的 `text/uri-list`，发布 Windows 文件列表；不把 `/mnt` 或桥接临时副本回传 |
-| 自动启动 | 默认不启动剪贴板服务；启用文件增强时只启动 Linux→Windows 文件服务；中文输入法使用独立用户服务 |
+| 自动启动 | 默认启用 wsl-clipboard-desktop.service，中文输入法使用独立用户服务 |
 
 脚本适用于 Debian / Ubuntu 的 WSLg X11 环境，DISPLAY 形如 `:0`。原生 X11 组件由发行版软件仓库按当前系统架构安装。
 
@@ -46,7 +56,7 @@ Windows 复制文件或目录后，窗口中的文件管理器获得 `text/uri-l
 # 查看计划
 bash /tmp/wsl-ai-install.sh --dry-run
 
-# 默认安装中文环境；剪贴板完全由 WSLg 原生同步处理
+# 默认安装中文环境和普通桌面剪贴板数据提供程序
 bash /tmp/wsl-ai-install.sh
 
 # 可选：从 WSLg 复制 Linux 文件后粘贴到 Windows
@@ -68,7 +78,7 @@ bash /tmp/wsl-ai-install.sh --check
 
 在增强窗口内试用中文多行文本、Win+Shift+S 截图、资源管理器中的文件与目录。文件应能从粘贴目标实际打开，图片应保持为图片。再从窗口内的文件管理器复制文件到资源管理器，打开粘贴后的副本核对内容。`--with-files` 另提供普通 X11 窗口到 Windows 的单向文件增强。
 
-剪贴板默认没有自动启动服务。只有使用 `--with-files` 时，用户服务才会在该 WSL 用户会话启动时运行。中文输入法用户服务独立管理。
+普通桌面剪贴板服务默认随该 WSL 用户会话启动。选择 `--native` 时会停用它。`--with-files` 启用 Linux 到 Windows 文件增强服务。中文输入法用户服务独立管理。
 
 ## 服务管理
 
@@ -81,7 +91,7 @@ systemctl --user status xclip-linux-files-bridge.service --no-pager -l
 journalctl --user -u xclip-linux-files-bridge.service -n 30 --no-pager
 
 # 停止并关闭自动启动
-systemctl --user disable --now xclip-linux-files-bridge.service wsl-fcitx5.service
+systemctl --user disable --now wsl-clipboard-desktop.service xclip-linux-files-bridge.service wsl-fcitx5.service
 ```
 
 遇到 `Unit not found`，先确认当前主机、WSL 名称、Linux 用户和安装时相同，再重新执行安装脚本。

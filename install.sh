@@ -6,8 +6,9 @@ umask 022
 DRY_RUN=false
 CHECK_ONLY=false
 INSTALL_CHINESE=true
-CLIPBOARD_MODE=native
+CLIPBOARD_MODE=desktop
 UPGRADE=false
+OPENCODE_SESSION=false
 STEP=准备
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wsl-ai-setup"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -23,15 +24,16 @@ trap 'printf "\n安装在【%s】失败（第%s行）。修复报错后可重新
 usage() {
     cat <<'HELP'
 用法 bash install.sh [选项]
-默认安装中文环境并使用 WSLg 原生剪贴板，不启动剪贴板监听。
+默认安装中文环境，并为普通 WSLg 窗口启用 Windows 剪贴板数据提供程序。
   --dry-run         显示安装计划，保持系统当前状态
   --check           检查依赖和后台服务状态
   --with-chinese    安装中文字体、语言和 Fcitx5 输入法（默认）
   --without-chinese 不安装中文字体、语言和 Fcitx5 输入法
-  --native          只使用 WSLg 原生剪贴板（默认）
+  --native          只使用 WSLg 原生剪贴板，不启用数据提供程序
   --file-session    安装双向文件、图片与文本的独立窗口启动器
   --with-files      启用 WSLg 到 Windows 的文件复制增强
   --upgrade         显式执行系统软件升级
+  --opencode-session 为已安装的 OpenCode 配置独立剪贴板窗口
   --skip-upgrade    跳过系统软件升级
   -h, --help        显示帮助
 请在目标 WSL 的普通用户终端运行，安装过程通过 sudo 请求管理员权限。
@@ -49,6 +51,7 @@ parse_args() {
             --file-session) CLIPBOARD_MODE=session ;;
             --with-files) CLIPBOARD_MODE=files-out ;;
             --upgrade) UPGRADE=true ;;
+            --opencode-session|--opencode-wayland) OPENCODE_SESSION=true ;;
             --skip-upgrade) UPGRADE=false ;;
             -h|--help) usage; exit 0 ;;
             *) fail "未知参数 $1" ;;
@@ -122,6 +125,17 @@ apt_run() {
 
 check_installation() {
     local failed=0
+    if [[ $CLIPBOARD_MODE == desktop ]]; then
+        [[ -x $HOME/.local/lib/wsl-clipboard-session/session &&
+           -r $HOME/.local/lib/wsl-clipboard-session/backend.ps1 ]] || {
+            printf '缺少普通 WSLg 剪贴板辅助程序。\n' >&2
+            failed=1
+        }
+        if ! user_systemctl is-active --quiet wsl-clipboard-desktop.service; then
+            printf '普通 WSLg 剪贴板服务未运行。\n' >&2
+            failed=1
+        fi
+    fi
     if [[ $CLIPBOARD_MODE == session ]]; then
         [[ -x $HOME/.local/bin/wsl-clipboard-app &&
            -x $HOME/.local/lib/wsl-clipboard-session/session &&
@@ -172,8 +186,11 @@ install_packages() {
         packages+=(locales fonts-noto-cjk fonts-wqy-microhei fontconfig fcitx5
             fcitx5-chinese-addons fcitx5-config-qt fcitx5-frontend-gtk3 fcitx5-frontend-qt5)
     fi
+    if [[ $CLIPBOARD_MODE == session || $CLIPBOARD_MODE == desktop ]]; then
+        packages+=(g++ pkg-config qtbase5-dev procps)
+    fi
     if [[ $CLIPBOARD_MODE == session ]]; then
-        packages+=(xserver-xephyr openbox dbus-daemon xauth x11-utils g++ pkg-config qtbase5-dev)
+        packages+=(xserver-xephyr openbox dbus-daemon xauth x11-utils)
     fi
     apt_run update
     if [[ $UPGRADE == true ]]; then apt_run upgrade -y; fi
@@ -648,10 +665,13 @@ static bool stageFiles(QMimeData &data, QTemporaryDir &dir, const QList<QByteArr
 
 int main(int argc, char **argv) {
     QGuiApplication app(argc, argv);
-    if (argc != 3) return 2;
+    if (argc != 3 && argc != 4) return 2;
+    const bool desktop = argc == 4 && QByteArray(argv[3]) == "--desktop";
+    if (argc == 4 && !desktop) return 2;
     QFile script(argv[2]);
     if (!script.open(QIODevice::ReadOnly)) return 1;
     QString src = QString::fromUtf8(script.readAll());
+    if (desktop) src.prepend("$nativeDesktop = $true\n");
     QByteArray encoded(reinterpret_cast<const char *>(src.utf16()), src.size()*2);
     QProcess host;
     host.setProcessChannelMode(QProcess::ForwardedErrorChannel);
@@ -663,8 +683,12 @@ int main(int argc, char **argv) {
             app.exit(1);
             return {"ERROR"};
         }
+        QElapsedTimer deadline;
+        deadline.start();
         while (!host.canReadLine()) {
-            if (!host.waitForReadyRead(30000)) {
+            host.waitForReadyRead(20);
+            app.processEvents(QEventLoop::ExcludeUserInputEvents);
+            if (host.state() == QProcess::NotRunning || deadline.elapsed() >= 30000) {
                 qCritical("Windows clipboard helper did not respond");
                 app.exit(1);
                 return {"ERROR"};
@@ -674,13 +698,15 @@ int main(int argc, char **argv) {
     };
     auto clipboard = app.clipboard();
     QByteArray seq = "-1";
-    bool dirty = false, importing = false;
+    bool dirty = false, importing = false, busy = false;
     QObject::connect(clipboard, &QClipboard::dataChanged, [&] {
-        if (!importing && !clipboard->ownsClipboard()) dirty = true;
+        if (!desktop && !importing && !clipboard->ownsClipboard()) dirty = true;
     });
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, [&] {
-        if (dirty && seq != "-1") {
+        if (busy) return;
+        QScopedValueRollback<bool> processing(busy, true);
+        if (!desktop && dirty && seq != "-1") {
             dirty = false;
             QByteArray request = offer(clipboard->mimeData(), seq);
             if (!request.isEmpty()) {
@@ -734,6 +760,14 @@ using System;
 using System.Runtime.InteropServices;
 public static class ClipVersion {
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+    public static string OwnerProcess() {
+        uint id;
+        GetWindowThreadProcessId(GetClipboardOwner(), out id);
+        try { return System.Diagnostics.Process.GetProcessById((int)id).ProcessName.ToLowerInvariant(); }
+        catch { return ""; }
+    }
     [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr window);
     [DllImport("user32.dll")] static extern bool CloseClipboard();
     [DllImport("user32.dll")] static extern bool EmptyClipboard();
@@ -770,7 +804,9 @@ public static class ClipVersion {
 }
 '@
 $window = New-Object Windows.Forms.Control
-$mutex = [Threading.Mutex]::new($false, 'Local\NorthwindWSLClipboardSession')
+$mutexName = 'Local\NorthwindWSLClipboardSession'
+if ($nativeDesktop) { $mutexName = 'Local\NorthwindWSLClipboardDesktop' }
+$mutex = [Threading.Mutex]::new($false, $mutexName)
 try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
 if (!$owned) { throw 'Another WSL file session is running' }
 $utf8 = New-Object Text.UTF8Encoding($false, $true)
@@ -782,6 +818,9 @@ function Exchange([string]$request) {
     if ($parts[0] -eq "CHECK") { if ($parts[1] -eq [string]$sequence) { return "CURRENT" }; return "CHANGED" }
     if ($parts[0] -eq 'READ') {
         if ($parts[1] -eq [string]$sequence) { return "SAME $sequence" }
+        # WSLg republishes Linux selections through its RDP client. Keep that
+        # local selection instead of importing the same content again.
+        if ($nativeDesktop -and [ClipVersion]::OwnerProcess() -in @('msrdc', 'mstsc')) { return "SAME $sequence" }
         $data = [Windows.Forms.Clipboard]::GetDataObject()
         $reply = "EMPTY $sequence"
         if ($data -and $data.GetDataPresent('FileDrop')) {
@@ -905,6 +944,46 @@ wait -n -p finished "$server" "$bridge" "$client"
 SESSION_LAUNCH
 }
 
+configure_opencode() {
+    if [[ $OPENCODE_SESSION != true ]]; then
+        local desktop override
+        for desktop in /usr/share/applications/*.desktop; do
+            override="$HOME/.local/share/applications/$(basename "$desktop")"
+            if [[ -f $override ]] && grep -Fq "$HOME/.local/bin/wsl-opencode" "$override"; then
+                write_user_file "$override" 644 < "$desktop"
+            fi
+        done
+        if [[ -e $HOME/.local/bin/wsl-opencode ]]; then
+            write_user_file "$HOME/.local/bin/wsl-opencode" 755 <<'DIRECT'
+#!/bin/bash
+exec ai.opencode "$@"
+DIRECT
+        fi
+        return
+    fi
+    STEP=OpenCode启动
+    local executable
+    executable=$(command -v ai.opencode || true)
+    [[ -x $executable ]] || fail '请先安装 OpenCode 桌面版，再使用 --opencode-session。'
+    write_user_file "$HOME/.local/bin/wsl-opencode" 755 <<'OPENCODE'
+#!/bin/bash
+set -euo pipefail
+if pgrep -u "$(id -u)" -x ai.opencode >/dev/null; then
+    printf '请先完全退出 OpenCode，再打开独立剪贴板窗口。\n' >&2
+    exit 1
+fi
+exec "$HOME/.local/bin/wsl-clipboard-app" ai.opencode --ozone-platform=x11 "$@"
+OPENCODE
+    # Match the package desktop IDs so Windows WSLg shortcuts use the override.
+    local desktop
+    for desktop in /usr/share/applications/*.desktop; do
+        [[ -f $desktop ]] || continue
+        if ! grep -Eq '^Exec=(/[^ ]*/)?ai\.opencode([[:space:]]|$)' "$desktop"; then continue; fi
+        sed -E "s#^Exec=(/[^ ]*/)?ai\\.opencode#Exec=\"$HOME/.local/bin/wsl-opencode\"#" "$desktop" > "$TEMP_DIR/opencode.desktop"
+        write_user_file "$HOME/.local/share/applications/$(basename "$desktop")" 644 < "$TEMP_DIR/opencode.desktop"
+    done
+}
+
 configure_services() {
     STEP=后台服务
     write_user_file "$HOME/.local/bin/xclip-bridge-start" 755 <<'START'
@@ -925,6 +1004,37 @@ printf '未找到 WSL 互操作 socket\n' >&2
 exit 1
 START
     local service_dir="$CONFIG_DIR/systemd/user"
+    write_user_file "$HOME/.local/bin/wsl-clipboard-desktop-start" 755 <<'DESKTOP_START'
+#!/bin/bash
+set -euo pipefail
+for socket in /run/WSL/1_interop /run/WSL/*_interop; do
+    if [[ -S $socket ]]; then
+        export WSL_INTEROP="$socket"
+        exec "$HOME/.local/lib/wsl-clipboard-session/session" \
+            /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
+            "$HOME/.local/lib/wsl-clipboard-session/backend.ps1" --desktop
+    fi
+done
+printf '未找到 WSL 互操作 socket\n' >&2
+exit 1
+DESKTOP_START
+    write_user_file "$service_dir/wsl-clipboard-desktop.service" 644 <<SERVICE
+[Unit]
+Description=Windows clipboard data for ordinary WSLg applications
+StartLimitIntervalSec=0
+[Service]
+ExecStart=%h/.local/bin/wsl-clipboard-desktop-start
+Environment="DISPLAY=$DISPLAY"
+Environment="WSL_DISTRO_NAME=$WSL_DISTRO_NAME"
+Environment=QT_QPA_PLATFORM=xcb
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=5
+UMask=0077
+[Install]
+WantedBy=default.target
+SERVICE
     write_user_file "$service_dir/xclip-linux-files-bridge.service" 644 <<SERVICE
 [Unit]
 Description=WSL Linux file clipboard publisher
@@ -968,11 +1078,17 @@ SERVICE
         fi
     done
     user_systemctl disable --now xclip-linux-files-bridge.service
+    if [[ $CLIPBOARD_MODE == desktop ]]; then
+        user_systemctl enable wsl-clipboard-desktop.service
+        user_systemctl restart wsl-clipboard-desktop.service
+    else
+        user_systemctl disable --now wsl-clipboard-desktop.service
+    fi
     case "$CLIPBOARD_MODE" in
         files-out)
             user_systemctl enable --now xclip-linux-files-bridge.service
             ;;
-        native|session) ;;
+        native|session|desktop) ;;
     esac
     if [[ $INSTALL_CHINESE == true ]]; then
         user_systemctl enable wsl-fcitx5.service
@@ -985,6 +1101,10 @@ SERVICE
         journalctl --user -u xclip-linux-files-bridge.service -n 20 --no-pager
         fail 'Linux 到 Windows 文件增强未持续运行。'
     fi
+    if [[ $CLIPBOARD_MODE == desktop ]] && ! user_systemctl is-active --quiet wsl-clipboard-desktop.service; then
+        journalctl --user -u wsl-clipboard-desktop.service -n 20 --no-pager
+        fail '普通 WSLg 剪贴板数据提供程序未持续运行。'
+    fi
     if [[ $INSTALL_CHINESE == true ]] && ! user_systemctl is-active --quiet wsl-fcitx5.service; then
         journalctl --user -u wsl-fcitx5.service -n 20 --no-pager
         fail 'Fcitx5 用户服务启动失败，请检查以上日志后重新运行。'
@@ -993,12 +1113,14 @@ SERVICE
 
 main() {
     parse_args "$@"
+    if [[ $OPENCODE_SESSION == true ]]; then CLIPBOARD_MODE=session; fi
     if [[ $DRY_RUN == true ]]; then
         printf '计划安装中文环境=%s，系统升级=%s\n' \
             "$([[ $INSTALL_CHINESE == true ]] && echo 是 || echo 否)" "$UPGRADE"
-        printf '剪贴板模式=%s（native=仅WSLg原生；files-out=Linux到Windows文件增强；session=独立窗口双向剪贴板）\n' "$CLIPBOARD_MODE"
+        printf '剪贴板模式=%s（desktop=普通WSLg窗口；native=仅WSLg原生；files-out=Linux到Windows文件增强；session=独立窗口双向剪贴板）\n' "$CLIPBOARD_MODE"
         printf '将安装 xclip 包和内嵌桥接源码；自动停止旧全量桥接，再按模式启用服务。\n'
         printf '已有配置备份至 ~/.local/state/wsl-ai-setup/backups。\n'
+        printf '普通 WSLg 模式可直接运行 ai.opencode；独立窗口需显式选择 --opencode-session。\n'
         return
     fi
     if [[ $CHECK_ONLY == true ]]; then check_installation; return; fi
@@ -1007,8 +1129,9 @@ main() {
     configure_wsl
     if [[ $INSTALL_CHINESE == true ]]; then configure_chinese; fi
     install_clipboard
-    if [[ $CLIPBOARD_MODE == session ]]; then install_file_session; fi
+    if [[ $CLIPBOARD_MODE == session || $CLIPBOARD_MODE == desktop ]]; then install_file_session; fi
     configure_services
+    configure_opencode
     STEP=完成
     log "配置备份位于 $BACKUP_DIR"
     check_installation
@@ -1017,6 +1140,8 @@ main() {
     fi
     if [[ $CLIPBOARD_MODE == session ]]; then
         printf '启动双向剪贴板窗口：~/.local/bin/wsl-clipboard-app 程序名 [参数...]\n'
+    elif [[ $CLIPBOARD_MODE == desktop ]]; then
+        printf '普通 WSLg 剪贴板服务已启用，可直接运行 ai.opencode。\n'
     else
         printf '普通 WSLg 窗口使用原生剪贴板。双向文件粘贴可选 --file-session。\n'
     fi
