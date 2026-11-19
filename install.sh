@@ -671,7 +671,11 @@ int main(int argc, char **argv) {
     QFile script(argv[2]);
     if (!script.open(QIODevice::ReadOnly)) return 1;
     QString src = QString::fromUtf8(script.readAll());
-    if (desktop) src.prepend("$nativeDesktop = $true\n");
+    if (desktop) {
+        QByteArray identity = qgetenv("WSL_DISTRO_NAME") + '\n' + qgetenv("DISPLAY");
+        QByteArray key = QCryptographicHash::hash(identity, QCryptographicHash::Sha256).toHex();
+        src.prepend("$nativeDesktop = $true\n$desktopIdentity = '" + QString::fromLatin1(key) + "'\n");
+    }
     QByteArray encoded(reinterpret_cast<const char *>(src.utf16()), src.size()*2);
     QProcess host;
     host.setProcessChannelMode(QProcess::ForwardedErrorChannel);
@@ -805,10 +809,13 @@ public static class ClipVersion {
 '@
 $window = New-Object Windows.Forms.Control
 $mutexName = 'Local\NorthwindWSLClipboardSession'
-if ($nativeDesktop) { $mutexName = 'Local\NorthwindWSLClipboardDesktop' }
+if ($nativeDesktop) { $mutexName = 'Local\NorthwindWSLClipboardDesktop.' + $desktopIdentity }
 $mutex = [Threading.Mutex]::new($false, $mutexName)
 try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
-if (!$owned) { throw 'Another WSL file session is running' }
+if (!$owned) {
+    if ($nativeDesktop) { throw 'A clipboard provider for this WSL distribution and display is already running' }
+    throw 'Another WSL file session is running'
+}
 $utf8 = New-Object Text.UTF8Encoding($false, $true)
 function Encode([string]$value) { [Convert]::ToBase64String($utf8.GetBytes($value)) }
 function Decode([string]$value) { $utf8.GetString([Convert]::FromBase64String($value)) }
