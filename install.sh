@@ -766,11 +766,10 @@ public static class ClipVersion {
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
-    public static string OwnerProcess() {
+    public static uint OwnerProcessId() {
         uint id;
         GetWindowThreadProcessId(GetClipboardOwner(), out id);
-        try { return System.Diagnostics.Process.GetProcessById((int)id).ProcessName.ToLowerInvariant(); }
-        catch { return ""; }
+        return id;
     }
     [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr window);
     [DllImport("user32.dll")] static extern bool CloseClipboard();
@@ -807,6 +806,34 @@ public static class ClipVersion {
     }
 }
 '@
+# A regular Remote Desktop client can also own incoming clipboard data.
+# Only the client explicitly launched with /wslg is a WSLg echo.
+$script:wslgOwnerKey = ''
+$script:wslgOwnerResult = $false
+function Test-WslgCommandLine([string]$commandLine) {
+    return $commandLine -match '(?i)(?:^|\s)/wslg(?:\s|$)'
+}
+function Test-WslgClipboardOwner {
+    try {
+        $ownerId = [ClipVersion]::OwnerProcessId()
+        if (!$ownerId) { return $false }
+        $process = [Diagnostics.Process]::GetProcessById([int]$ownerId)
+        try {
+            if ($process.ProcessName -notin @('msrdc', 'mstsc')) { return $false }
+            $key = [string]$ownerId + ':' + [string]$process.StartTime.Ticks
+        } finally { $process.Dispose() }
+        if ($key -eq $script:wslgOwnerKey) { return $script:wslgOwnerResult }
+        $details = Get-CimInstance Win32_Process -Filter "ProcessId = $ownerId" -ErrorAction Stop
+        if (!$details -or !$details.CommandLine) { return $false }
+        $result = Test-WslgCommandLine $details.CommandLine
+        $script:wslgOwnerKey = $key
+        $script:wslgOwnerResult = $result
+        return $result
+    } catch {
+        # An unavailable process identity must not discard a remote clipboard.
+        return $false
+    }
+}
 $window = New-Object Windows.Forms.Control
 $mutexName = 'Local\NorthwindWSLClipboardSession'
 if ($nativeDesktop) { $mutexName = 'Local\NorthwindWSLClipboardDesktop.' + $desktopIdentity }
@@ -827,7 +854,7 @@ function Exchange([string]$request) {
         if ($parts[1] -eq [string]$sequence) { return "SAME $sequence" }
         # WSLg republishes Linux selections through its RDP client. Keep that
         # local selection instead of importing the same content again.
-        if ($nativeDesktop -and [ClipVersion]::OwnerProcess() -in @('msrdc', 'mstsc')) { return "SAME $sequence" }
+        if ($nativeDesktop -and (Test-WslgClipboardOwner)) { return "SAME $sequence" }
         $data = [Windows.Forms.Clipboard]::GetDataObject()
         $reply = "EMPTY $sequence"
         if ($data -and $data.GetDataPresent('FileDrop')) {
