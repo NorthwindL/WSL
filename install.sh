@@ -206,18 +206,18 @@ configure_wsl() {
     else
         : > "$TEMP_DIR/wsl.conf"
     fi
-    set_ini_value boot systemd true "$TEMP_DIR/wsl.conf" > "$TEMP_DIR/wsl.1"
+    set_ini_value boot systemd false "$TEMP_DIR/wsl.conf" > "$TEMP_DIR/wsl.1"
     set_ini_value interop enabled true "$TEMP_DIR/wsl.1" > "$TEMP_DIR/wsl.2"
     set_ini_value interop appendWindowsPath true "$TEMP_DIR/wsl.2" > "$TEMP_DIR/wsl.3"
     if ! sudo cmp -s /etc/wsl.conf "$TEMP_DIR/wsl.3"; then
         backup /etc/wsl.conf
         sudo install -m 644 "$TEMP_DIR/wsl.3" /etc/wsl.conf
     fi
-    if [[ $(ps -p 1 -o comm=) != systemd ]]; then
-        log '已启用 systemd。请保存工作，重新启动此 WSL 发行版后，再运行相同安装命令。'
-        exit 2
-    fi
-    [[ -S /run/user/$(id -u)/bus ]] || fail 'systemd 用户总线尚未就绪。请重新进入当前 WSL 用户后再次运行。'
+    #if [[ $(ps -p 1 -o comm=) != systemd ]]; then
+     #   log '已启用 systemd。请保存工作，重新启动此 WSL 发行版后，再运行相同安装命令。'
+      #  exit 2
+    #fi
+    #[[ -S /run/user/$(id -u)/bus ]] || fail 'systemd 用户总线尚未就绪。请重新进入当前 WSL 用户后再次运行。'
 }
 
 configure_chinese() {
@@ -1164,7 +1164,7 @@ main() {
     if [[ $INSTALL_CHINESE == true ]]; then configure_chinese; fi
     install_clipboard
     if [[ $CLIPBOARD_MODE == session || $CLIPBOARD_MODE == desktop ]]; then install_file_session; fi
-    configure_services
+   # configure_services
     configure_opencode
     STEP=完成
     log "配置备份位于 $BACKUP_DIR"
