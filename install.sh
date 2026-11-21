@@ -867,6 +867,7 @@ int main(int argc, char **argv) {
     QObject::connect(&timer, &QTimer::timeout, [&] {
         if (busy) return;
         QScopedValueRollback<bool> processing(busy, true);
+        bool retryExport = false;
         if ((!desktop || filesOnly) && dirty && seq != "-1") {
             dirty = false;
             QByteArray request = offer(clipboard->mimeData(), seq, filesOnly);
@@ -874,12 +875,17 @@ int main(int argc, char **argv) {
                 auto reply = exchange(request);
                 if (reply.first() == "OK") { seq = reply.value(1); return; }
                 if (reply.first() == "ERROR") { dirty = true; return; }
+                // WSLg may have mirrored this selection while we prepared the
+                // file offer. Refresh its version before retrying the export.
+                if (reply.first() == "CHANGED") { retryExport = true; dirty = true; }
             }
         }
         auto frame = exchange("READ " + seq);
         auto type = frame.first(), version = frame.value(1);
         if (type == "SAME") { seq = version; return; }
         if (type == "ERROR" || type == "CHANGED") return;
+        // A new external Windows selection wins over an outdated local offer.
+        if (retryExport) dirty = false;
         if (filesOnly && type != "FILES") { seq = version; return; }
         auto data = std::make_unique<QMimeData>();
         StagedFiles staging;
