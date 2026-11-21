@@ -5,7 +5,7 @@ umask 022
 
 DRY_RUN=false
 CHECK_ONLY=false
-INSTALL_CHINESE=false
+INSTALL_CHINESE=true
 CLIPBOARD_MODE=files
 UPGRADE=false
 OPENCODE_SESSION=false
@@ -24,10 +24,10 @@ trap 'printf "\n安装在【%s】失败（第%s行）。修复报错后可重新
 usage() {
     cat <<'HELP'
 用法 bash install.sh [选项]
-默认启用双向文件桥接；文字、截图使用 WSLg 原生通道，不安装中文环境或独立桌面。
+默认启用双向文件桥接；文字、截图使用 WSLg 原生通道，默认安装中文环境和 Fcitx5，不安装独立桌面。
   --dry-run         显示安装计划，保持系统当前状态
   --check           检查依赖和后台服务状态
-  --with-chinese    安装中文字体、语言和 Fcitx5 输入法（可选）
+  --with-chinese    安装中文字体、语言和 Fcitx5 输入法（默认）
   --without-chinese 不安装中文字体、语言和 Fcitx5 输入法
   --native          仅原生通道，显式关闭文件桥接
   --desktop-bridge  可选：为普通 X11 窗口提供 Windows 剪贴板数据

@@ -103,7 +103,13 @@ class InstallerTests(unittest.TestCase):
                            (['--file-session'], 'session'), (['--desktop-bridge'], 'desktop')]:
             output = subprocess.check_output(['bash', str(script), '--dry-run', *args], text=True)
             self.assertIn('剪贴板模式=' + mode, output)
-            self.assertIn('中文环境=否', output)
+            self.assertIn('中文环境=是', output)
+        for args, expected in [(['--without-chinese'], '否'),
+                               (['--with-chinese'], '是'),
+                               (['--without-chinese', '--with-chinese'], '是')]:
+            output = subprocess.check_output(['bash', str(script), '--dry-run', *args], text=True)
+            self.assertIn('中文环境=' + expected, output)
+            self.assertIn('剪贴板模式=files', output)
 
     def test_all_embedded_shell_scripts_parse(self):
         for marker in ('XCLIP_SOURCE', 'SESSION_LAUNCH', 'DIRECT', 'OPENCODE', 'START', 'DESKTOP_START'):

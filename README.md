@@ -7,12 +7,13 @@ curl -fL --retry 3 https://raw.githubusercontent.com/NorthwindL/WSL/main/install
 bash /tmp/wsl-ai-install.sh
 ```
 
-安装时按提示输入 Linux 用户的 sudo 密码。默认启用双向文件桥接，文字和截图使用 WSLg 原生剪贴板。默认不安装中文语言包、输入法或独立桌面，不修改应用的显示后端。安装后退出并重新打开目标应用。
+安装时按提示输入 Linux 用户的 sudo 密码。默认启用双向文件桥接，文字和截图使用 WSLg 原生剪贴板。默认安装中文字体、中文语言环境、Fcitx5 中文输入法及配置工具（fcitx5-configtool），不安装独立桌面，不修改应用的显示后端。安装后退出并重新打开目标应用。
 
 ## 默认行为
 
 | 内容 | 实现方式 |
 |---|---|
+| 中文环境与输入法 | 默认安装中文字体、zh_CN.UTF-8、Fcitx5、拼音和配置工具 |
 | 中文文字、多行、emoji | 使用 WSLg 原生通道，保留原生 xclip 的选择区和参数行为 |
 | Windows 截图 | 使用 WSLg 原生图片通道；安装 wl-copy / wl-paste 便于操作 Wayland 剪贴板 |
 | Windows → WSLg 文件 | 后台服务读取 Windows 磁盘文件列表，完成受限复制后向当前 X11 剪贴板发布 text/uri-list |
@@ -34,11 +35,11 @@ Windows 虚拟文件对象（如部分邮件附件）未实现 IStream 协议，
 # 预览安装计划（不修改系统）
 bash /tmp/wsl-ai-install.sh --dry-run
 
-# 默认：双向文件桥接；文字与截图走 WSLg 原生通道
+# 默认：中文环境、Fcitx5 和双向文件桥接；文字与截图走 WSLg 原生通道
 bash /tmp/wsl-ai-install.sh
 
-# 同时安装中文字体、语言和 Fcitx5
-bash /tmp/wsl-ai-install.sh --with-chinese
+# 跳过中文字体、语言和 Fcitx5 安装
+bash /tmp/wsl-ai-install.sh --without-chinese
 
 # 检查默认文件桥接
 bash /tmp/wsl-ai-install.sh --check
@@ -66,11 +67,11 @@ bash /tmp/wsl-ai-install.sh --upgrade
 
 ## 安装依赖和重启
 
-基础依赖为 xclip、wl-clipboard、python3、dbus-user-session、systemd、systemd-sysv、coreutils、util-linux、libc-bin 和 diffutils。默认双向文件桥接还需要 g++、pkg-config、qtbase5-dev 和 procps。安装器使用 `--no-install-recommends`，默认只更新 APT 索引并安装依赖。中文环境与系统升级须显式选择。
+基础依赖为 xclip、wl-clipboard、python3、dbus-user-session、systemd、systemd-sysv、coreutils、util-linux、libc-bin 和 diffutils。默认双向文件桥接还需要 g++、pkg-config、qtbase5-dev 和 procps。安装器使用 `--no-install-recommends`，默认只更新 APT 索引并安装依赖。中文环境默认安装，可用 `--without-chinese` 跳过；系统升级须显式选择。
 
 若 PID 1 不是 systemd，安装器会合并 /etc/wsl.conf 的 systemd 与互操作设置，保留其他键，以状态码 2 退出。保存工作后，在 Windows 终端运行 `wsl -t <发行版名>`，再运行 `wsl -d <发行版名>`，然后重新执行安装命令。systemd 用户总线必须可用。
 
-已有被修改配置备份至 `~/.local/state/wsl-ai-setup/backups/时间-进程号/`。重复安装会按所选模式管理桥接服务。默认不改变已有语言配置；如旧版已安装中文环境，跳过中文安装不会卸载软件或删除其环境变量。
+已有被修改配置备份至 `~/.local/state/wsl-ai-setup/backups/时间-进程号/`。重复安装会按所选模式管理桥接服务。默认生成 zh_CN.UTF-8 并设置系统默认 LANG，配置 Fcitx5；已有输入法 profile 保留。安装完成后重新进入 WSL 用户会话，并重新打开应用；可运行 `fcitx5-configtool` 调整输入法。`--with-chinese` 保留为显式启用参数；`--without-chinese` 跳过中文安装，但不会卸载已有软件或删除其环境变量。
 
 ## 验证与排查
 
