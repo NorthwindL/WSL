@@ -5,8 +5,8 @@ umask 022
 
 DRY_RUN=false
 CHECK_ONLY=false
-INSTALL_CHINESE=true
-CLIPBOARD_MODE=desktop
+INSTALL_CHINESE=false
+CLIPBOARD_MODE=files
 UPGRADE=false
 OPENCODE_SESSION=false
 STEP=准备
@@ -24,14 +24,16 @@ trap 'printf "\n安装在【%s】失败（第%s行）。修复报错后可重新
 usage() {
     cat <<'HELP'
 用法 bash install.sh [选项]
-默认安装中文环境，并为普通 WSLg 窗口启用 Windows 剪贴板数据提供程序。
+默认启用双向文件桥接；文字、截图使用 WSLg 原生通道，不安装中文环境或独立桌面。
   --dry-run         显示安装计划，保持系统当前状态
   --check           检查依赖和后台服务状态
-  --with-chinese    安装中文字体、语言和 Fcitx5 输入法（默认）
+  --with-chinese    安装中文字体、语言和 Fcitx5 输入法（可选）
   --without-chinese 不安装中文字体、语言和 Fcitx5 输入法
-  --native          只使用 WSLg 原生剪贴板，不启用数据提供程序
+  --native          仅原生通道，显式关闭文件桥接
+  --desktop-bridge  可选：为普通 X11 窗口提供 Windows 剪贴板数据
   --file-session    安装双向文件、图片与文本的独立窗口启动器
-  --with-files      启用 WSLg 到 Windows 的文件复制增强
+  --with-files      双向文件桥接（默认）
+  --files-out       仅启用 WSLg 到 Windows 文件桥接
   --upgrade         显式执行系统软件升级
   --opencode-session 为已安装的 OpenCode 配置独立剪贴板窗口
   --skip-upgrade    跳过系统软件升级
@@ -48,8 +50,10 @@ parse_args() {
             --with-chinese) INSTALL_CHINESE=true ;;
             --without-chinese) INSTALL_CHINESE=false ;;
             --native) CLIPBOARD_MODE=native ;;
+            --desktop-bridge) CLIPBOARD_MODE=desktop ;;
             --file-session) CLIPBOARD_MODE=session ;;
-            --with-files) CLIPBOARD_MODE=files-out ;;
+            --with-files) CLIPBOARD_MODE=files ;;
+            --files-out) CLIPBOARD_MODE=files-out ;;
             --upgrade) UPGRADE=true ;;
             --opencode-session|--opencode-wayland) OPENCODE_SESSION=true ;;
             --skip-upgrade) UPGRADE=false ;;
@@ -125,7 +129,7 @@ apt_run() {
 
 check_installation() {
     local failed=0
-    if [[ $CLIPBOARD_MODE == desktop ]]; then
+    if [[ $CLIPBOARD_MODE == desktop || $CLIPBOARD_MODE == files ]]; then
         [[ -x $HOME/.local/lib/wsl-clipboard-session/session &&
            -r $HOME/.local/lib/wsl-clipboard-session/backend.ps1 ]] || {
             printf '缺少普通 WSLg 剪贴板辅助程序。\n' >&2
@@ -144,9 +148,13 @@ check_installation() {
             failed=1
         }
     fi
-    for path in /usr/local/bin/xclip "$HOME/.local/lib/xclip-x11/usr/bin/xclip"; do
+    for path in /usr/local/bin/xclip /usr/bin/wl-copy /usr/bin/wl-paste "$HOME/.local/bin/wsl-xclip" "$HOME/.local/lib/wsl-clipboard-session/stage-files"; do
         if [[ -x $path ]]; then printf '已安装 %s\n' "$path"; else printf '缺少 %s\n' "$path"; failed=1; fi
     done
+    if ! user_systemctl is-active --quiet wsl-clipboard-cleanup.timer; then
+        printf '文件副本清理定时器未运行。\n' >&2
+        failed=1
+    fi
     for service in xclip-files-bridge.service xclip-linux-files-bridge.service xclip-bridge.service; do
         if user_systemctl is-enabled "$service" >/dev/null 2>&1 ||
             user_systemctl is-active "$service" >/dev/null 2>&1; then
@@ -180,13 +188,13 @@ preflight() {
 
 install_packages() {
     STEP=系统组件
-    local packages=(coreutils util-linux libc-bin diffutils xclip dbus-user-session
+    local packages=(coreutils util-linux libc-bin diffutils xclip wl-clipboard python3 dbus-user-session
         systemd systemd-sysv)
     if [[ $INSTALL_CHINESE == true ]]; then
         packages+=(locales fonts-noto-cjk fonts-wqy-microhei fontconfig fcitx5
             fcitx5-chinese-addons fcitx5-config-qt fcitx5-frontend-gtk3 fcitx5-frontend-qt5)
     fi
-    if [[ $CLIPBOARD_MODE == session || $CLIPBOARD_MODE == desktop ]]; then
+    if [[ $CLIPBOARD_MODE == session || $CLIPBOARD_MODE == desktop || $CLIPBOARD_MODE == files ]]; then
         packages+=(g++ pkg-config qtbase5-dev procps)
     fi
     if [[ $CLIPBOARD_MODE == session ]]; then
@@ -353,21 +361,18 @@ trap 'exit 143' TERM HUP
 
 copy_files() {
     : > "$work/paths" || die 'cannot create copy manifest'
-    copy_root=$(mktemp -d /tmp/chatgpt-clipboard.XXXXXXXX) || die 'cannot create copy directory'
-    index=0
+    sources=()
     while IFS= read -r path_b64 <&3; do
         [[ -n $path_b64 ]] || continue
         win_path=$(printf '%s' "$path_b64" | base64 -d) || die 'invalid file path payload'
         source_path=$(wslpath -u "$win_path") || die 'path conversion failed'
-        [[ -f $source_path || -d $source_path ]] || die "source unavailable: $source_path"
-        name=$(basename -- "$source_path")
-        [[ $name != / && $name != . && $name != .. ]] || die 'cannot copy a filesystem root'
+        sources+=("$source_path")
+    done
+    "$HOME/.local/lib/wsl-clipboard-session/stage-files" --null "${sources[@]}" > "$work/staged" || die 'file staging failed'
+    index=0
+    while IFS= read -r -d '' destination; do
         index=$((index + 1))
-        # Per-item subdirectories preserve duplicate basenames.
-        mkdir -- "$copy_root/$index" || die 'cannot create item directory'
-        cp -RL -- "$source_path" "$copy_root/$index/$name" || die "copy failed: $source_path"
-        chmod -R u+rwX -- "$copy_root/$index" || die 'cannot set Linux copy permissions'
-        destination="$copy_root/$index/$name"
+        if [[ -z $copy_root ]]; then copy_root=$(dirname -- "$(dirname -- "$destination")"); fi
         if [[ $kind == uris ]]; then
             # URI bytes are percent-encoded, including spaces and UTF-8.
             uri=
@@ -383,7 +388,7 @@ copy_files() {
         else
             printf '%s\n' "$destination" >> "$work/paths" || die 'cannot write copy manifest'
         fi
-    done
+    done < "$work/staged"
     ((index > 0)) || die 'empty file list'
     # Publish paths only after every copy has completed successfully.
     cat -- "$work/paths" || die 'cannot output copy manifest'
@@ -456,7 +461,7 @@ WATCH_POWERSHELL
                     decoded_path+=$char
                 fi
             done
-            [[ $decoded_path == /mnt/* || $decoded_path == /tmp/chatgpt-clipboard.* ]] && { valid_count=0; break; }
+            [[ $decoded_path == /tmp/chatgpt-clipboard.* || $decoded_path == "$HOME/.cache/wsl-clipboard/files/"* ]] && { valid_count=0; break; }
             [[ -f $decoded_path || -d $decoded_path ]] || { valid_count=0; break; }
             windows_path=$(wslpath -w -- "$decoded_path") || { valid_count=0; break; }
             printf '%s' "$windows_path" | base64 -w 0 >> "$work/windows-paths.b64"
@@ -587,13 +592,138 @@ case "$response_kind" in
 esac
 XCLIP_SOURCE
     bash -n "$TEMP_DIR/xclip"
-    if ! cmp -s /usr/local/bin/xclip "$TEMP_DIR/xclip"; then
+    write_user_file "$HOME/.local/bin/wsl-xclip" 755 < "$TEMP_DIR/xclip"
+    # Preserve the native X11 selection protocol and options for existing callers.
+    printf '#!/bin/sh\nexec /usr/bin/xclip "$@"\n' > "$TEMP_DIR/native-xclip"
+    if ! cmp -s /usr/local/bin/xclip "$TEMP_DIR/native-xclip"; then
         backup /usr/local/bin/xclip
-        sudo install -m 755 "$TEMP_DIR/xclip" /usr/local/bin/.xclip-wsl-ai-setup.$$
+        sudo install -m 755 "$TEMP_DIR/native-xclip" /usr/local/bin/.xclip-wsl-ai-setup.$$
         sudo mv -f /usr/local/bin/.xclip-wsl-ai-setup.$$ /usr/local/bin/xclip
     fi
-    sudo chmod 755 /usr/local/bin/xclip
-    /usr/local/bin/xclip --version
+}
+
+install_file_staging() {
+    write_user_file "$HOME/.local/lib/wsl-clipboard-session/stage-files" 755 <<'STAGE_FILES'
+#!/usr/bin/python3
+"""Bounded private file copies shared by the shell and Qt clipboard bridges."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import stat
+import sys
+import tempfile
+import time
+
+MAX_BYTES = 512 * 1024 * 1024
+MAX_ENTRIES = 10000
+RESERVE = 64 * 1024 * 1024
+TTL = 24 * 3600
+ROOT = Path.home() / '.cache/wsl-clipboard/files'
+
+
+def cleanup(root):
+    for item in root.glob('copy-*'):
+        info = item.lstat()
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and time.time() - info.st_mtime > TTL:
+            shutil.rmtree(item)
+
+
+def stage(paths, root):
+    if not paths:
+        raise ValueError('empty file list')
+    plan, total = [], 0
+
+    def inspect(source, relative):
+        nonlocal total
+        info = source.lstat()
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            raise ValueError('symbolic links and special files are unsupported: ' + str(source))
+        if len(plan) >= MAX_ENTRIES:
+            raise ValueError('file selection exceeds 10000 entries')
+        total += info.st_size if stat.S_ISREG(info.st_mode) else 0
+        if total > MAX_BYTES:
+            raise ValueError('file selection exceeds 512 MiB')
+        plan.append((source, relative, info))
+        if stat.S_ISDIR(info.st_mode):
+            for child in source.iterdir():
+                inspect(child, relative / child.name)
+
+    names = []
+    for index, value in enumerate(paths, 1):
+        source = Path(os.path.abspath(value))
+        if source == Path(source.anchor) or source == root or root in source.parents or source in root.parents:
+            raise ValueError('cannot stage filesystem roots or clipboard cache')
+        relative = Path(str(index)) / source.name
+        inspect(source, relative)
+        names.append(relative)
+    if shutil.disk_usage(root).free < total + RESERVE:
+        raise ValueError('insufficient disk space (64 MiB reserve required)')
+    target = Path(tempfile.mkdtemp(prefix='copy-', dir=root))
+    copied = 0
+    try:
+        for source, relative, info in plan:
+            dest = target / relative
+            dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if stat.S_ISDIR(info.st_mode):
+                dest.mkdir(mode=0o700)
+                continue
+            fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as src:
+                current = os.fstat(src.fileno())
+                if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                    raise ValueError('source changed during copy')
+                with dest.open('xb') as out:
+                    os.chmod(dest, 0o600 | (info.st_mode & 0o100))
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > MAX_BYTES or shutil.disk_usage(root).free < len(chunk) + RESERVE:
+                            raise ValueError('copy exceeds size or available space limit')
+                        out.write(chunk)
+        os.utime(target, None)
+        return [str(target / name) for name in names]
+    except BaseException:
+        shutil.rmtree(target)
+        raise
+
+
+def main():
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, interrupted)
+    os.umask(0o077)
+    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if ROOT.is_symlink() or ROOT.stat().st_uid != os.getuid():
+        raise ValueError('clipboard cache must be owned by the current user')
+    ROOT.chmod(0o700)
+    with (ROOT / '.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        cleanup(ROOT)
+        args = sys.argv[1:]
+        if args == ['--cleanup']:
+            return
+        null = args[:1] == ['--null']
+        if null:
+            args = args[1:]
+        result = stage(args, ROOT)
+        if null:
+            sys.stdout.buffer.write(b'\0'.join(os.fsencode(p) for p in result) + b'\0')
+        else:
+            print(json.dumps(result, ensure_ascii=True))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RecursionError) as error:
+        print('file staging: ' + str(error), file=sys.stderr)
+        sys.exit(1)
+STAGE_FILES
 }
 
 install_file_session() {
@@ -611,7 +741,7 @@ static QString mapPath(QString flag, QString path) {
     return QString::fromUtf8(bytes);
 }
 
-static QByteArray offer(const QMimeData *data, QByteArray seq) {
+static QByteArray offer(const QMimeData *data, QByteArray seq, bool filesOnly) {
     if (!data) return {};
     QList<QUrl> urls = data->urls();
     if (urls.isEmpty() && data->hasFormat("x-special/gnome-copied-files")) {
@@ -625,12 +755,14 @@ static QByteArray offer(const QMimeData *data, QByteArray seq) {
         QByteArray result = "FILES " + seq;
         for (const auto &url : urls) {
             if (!url.isLocalFile() || !QFileInfo::exists(url.toLocalFile())) return {};
+            if (url.toLocalFile().startsWith(QDir::homePath() + "/.cache/wsl-clipboard/files/")) return {};
             QString path = mapPath("-w", url.toLocalFile());
             if (path.isEmpty()) return {};
             result += " " + path.toUtf8().toBase64();
         }
         return result;
     }
+    if (filesOnly) return {};
     if (data->hasImage()) {
         QBuffer png;
         png.open(QIODevice::WriteOnly);
@@ -641,20 +773,43 @@ static QByteArray offer(const QMimeData *data, QByteArray seq) {
     return {};
 }
 
-static bool stageFiles(QMimeData &data, QTemporaryDir &dir, const QList<QByteArray> &paths) {
+struct StagedFiles {
+    QString root;
+    bool keep = false;
+    ~StagedFiles() { if (!keep && !root.isEmpty()) QDir(root).removeRecursively(); }
+};
+
+static bool stageFiles(QMimeData &data, StagedFiles &staging, const QList<QByteArray> &paths) {
     QList<QUrl> urls;
-    QStringList names;
+    QStringList names, sources;
     for (const auto &encoded : paths) {
         QString path = mapPath("-u", QString::fromUtf8(QByteArray::fromBase64(encoded)));
-        QFileInfo info(path);
-        QString subdir = dir.filePath(QString::number(urls.size() + 1));
-        if (!info.isAbsolute() || info.fileName().isEmpty() || info.fileName() == "." ||
-            info.fileName() == ".." || info.isSymLink() ||
-            !(info.isFile() || info.isDir()) || !QDir().mkdir(subdir) ||
-            QProcess::execute("cp", {"-R", "-P", "--", path, subdir + "/"}) != 0) return false;
-        names << subdir + "/" + info.fileName();
+        if (path.isEmpty()) return false;
+        sources << path;
+    }
+    QProcess stage;
+    stage.start(QDir::homePath() + "/.local/lib/wsl-clipboard-session/stage-files", sources);
+    if (!stage.waitForStarted()) return false;
+    QElapsedTimer deadline;
+    deadline.start();
+    while (stage.state() != QProcess::NotRunning && deadline.elapsed() < 120000) {
+        stage.waitForFinished(20);
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    }
+    if (stage.state() != QProcess::NotRunning || stage.exitStatus() != QProcess::NormalExit || stage.exitCode() != 0) {
+        stage.terminate();
+        if (!stage.waitForFinished(3000)) { stage.kill(); stage.waitForFinished(); }
+        qWarning().noquote() << stage.readAllStandardError();
+        return false;
+    }
+    const auto result = QJsonDocument::fromJson(stage.readAllStandardOutput());
+    if (!result.isArray()) return false;
+    for (const auto &entry : result.array()) {
+        if (!entry.isString()) return false;
+        names << entry.toString();
         urls << QUrl::fromLocalFile(names.last());
     }
+    if (!names.isEmpty()) staging.root = QFileInfo(QFileInfo(names.first()).path()).path();
     data.setUrls(urls);
     data.setText(names.join('\n'));
     QByteArray gnomeFiles = "copy";
@@ -666,7 +821,8 @@ static bool stageFiles(QMimeData &data, QTemporaryDir &dir, const QList<QByteArr
 int main(int argc, char **argv) {
     QGuiApplication app(argc, argv);
     if (argc != 3 && argc != 4) return 2;
-    const bool desktop = argc == 4 && QByteArray(argv[3]) == "--desktop";
+    const bool filesOnly = argc == 4 && QByteArray(argv[3]) == "--files-only";
+    const bool desktop = filesOnly || (argc == 4 && QByteArray(argv[3]) == "--desktop");
     if (argc == 4 && !desktop) return 2;
     QFile script(argv[2]);
     if (!script.open(QIODevice::ReadOnly)) return 1;
@@ -676,6 +832,7 @@ int main(int argc, char **argv) {
         QByteArray key = QCryptographicHash::hash(identity, QCryptographicHash::Sha256).toHex();
         src.prepend("$nativeDesktop = $true\n$desktopIdentity = '" + QString::fromLatin1(key) + "'\n");
     }
+    if (filesOnly) src.prepend("$filesOnly = $true\n");
     QByteArray encoded(reinterpret_cast<const char *>(src.utf16()), src.size()*2);
     QProcess host;
     host.setProcessChannelMode(QProcess::ForwardedErrorChannel);
@@ -704,16 +861,16 @@ int main(int argc, char **argv) {
     QByteArray seq = "-1";
     bool dirty = false, importing = false, busy = false;
     QObject::connect(clipboard, &QClipboard::dataChanged, [&] {
-        if (!desktop && !importing && !clipboard->ownsClipboard()) dirty = true;
+        if ((!desktop || filesOnly) && !importing && !clipboard->ownsClipboard()) dirty = true;
     });
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, [&] {
         if (busy) return;
         QScopedValueRollback<bool> processing(busy, true);
-        if (!desktop && dirty && seq != "-1") {
+        if ((!desktop || filesOnly) && dirty && seq != "-1") {
             dirty = false;
-            QByteArray request = offer(clipboard->mimeData(), seq);
-            if (!request.isEmpty()) {
+            QByteArray request = offer(clipboard->mimeData(), seq, filesOnly);
+            if (!request.isEmpty() && (!filesOnly || request.startsWith("FILES "))) {
                 auto reply = exchange(request);
                 if (reply.first() == "OK") { seq = reply.value(1); return; }
                 if (reply.first() == "ERROR") { dirty = true; return; }
@@ -721,15 +878,17 @@ int main(int argc, char **argv) {
         }
         auto frame = exchange("READ " + seq);
         auto type = frame.first(), version = frame.value(1);
-        if (type == "SAME" || type == "ERROR" || type == "CHANGED") return;
+        if (type == "SAME") { seq = version; return; }
+        if (type == "ERROR" || type == "CHANGED") return;
+        if (filesOnly && type != "FILES") { seq = version; return; }
         auto data = std::make_unique<QMimeData>();
-        std::unique_ptr<QTemporaryDir> staging;
+        StagedFiles staging;
         if (type == "FILES") {
-            staging = std::make_unique<QTemporaryDir>("/tmp/chatgpt-clipboard.XXXXXXXX");
-            if (!staging->isValid() || !stageFiles(*data, *staging, frame.mid(2))) {
+            if (!stageFiles(*data, staging, frame.mid(2))) {
                 qWarning("Could not stage the complete file selection");
                 data = std::make_unique<QMimeData>();
-                staging.reset();
+                seq = version;
+                return;
             }
         } else if (type == "TEXT") {
             QString text = QString::fromUtf8(QByteArray::fromBase64(frame.value(2)));
@@ -741,7 +900,7 @@ int main(int argc, char **argv) {
         if (exchange("CHECK " + version).first() != "CURRENT") return;
         app.processEvents(QEventLoop::ExcludeUserInputEvents);
         if (dirty && seq != "-1") return;
-        if (staging) staging->setAutoRemove(false);
+        staging.keep = true;
         importing = true;
         clipboard->setMimeData(data.release());
         importing = false;
@@ -860,6 +1019,8 @@ function Exchange([string]$request) {
         if ($data -and $data.GetDataPresent('FileDrop')) {
             $paths = @(foreach ($path in $data.GetData('FileDrop')) { Encode $path })
             $reply = "FILES $sequence " + ($paths -join ' ')
+        } elseif ($filesOnly) {
+            return "EMPTY $sequence"
         } elseif ($data -and $data.GetDataPresent('PNG', $false)) {
             $stream = $data.GetData('PNG', $false)
             $reply = "IMAGE $sequence " + [Convert]::ToBase64String($stream.ToArray())
@@ -1031,7 +1192,7 @@ esac
 for socket in /run/WSL/1_interop /run/WSL/*_interop; do
     if [[ -S $socket ]]; then
         export WSL_INTEROP="$socket"
-        exec /usr/local/bin/xclip "${watch_args[@]}"
+        exec "$HOME/.local/bin/wsl-xclip" "${watch_args[@]}"
     fi
 done
 printf '未找到 WSL 互操作 socket\n' >&2
@@ -1046,7 +1207,7 @@ for socket in /run/WSL/1_interop /run/WSL/*_interop; do
         export WSL_INTEROP="$socket"
         exec "$HOME/.local/lib/wsl-clipboard-session/session" \
             /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
-            "$HOME/.local/lib/wsl-clipboard-session/backend.ps1" --desktop
+            "$HOME/.local/lib/wsl-clipboard-session/backend.ps1" "${1:---files-only}"
     fi
 done
 printf '未找到 WSL 互操作 socket\n' >&2
@@ -1057,7 +1218,7 @@ DESKTOP_START
 Description=Windows clipboard data for ordinary WSLg applications
 StartLimitIntervalSec=0
 [Service]
-ExecStart=%h/.local/bin/wsl-clipboard-desktop-start
+ExecStart=%h/.local/bin/wsl-clipboard-desktop-start --$([[ $CLIPBOARD_MODE == desktop ]] && echo desktop || echo files-only)
 Environment="DISPLAY=$DISPLAY"
 Environment="WSL_DISTRO_NAME=$WSL_DISTRO_NAME"
 Environment=QT_QPA_PLATFORM=xcb
@@ -1104,7 +1265,24 @@ RestartSec=3
 WantedBy=default.target
 SERVICE
     fi
+    write_user_file "$service_dir/wsl-clipboard-cleanup.service" 644 <<'SERVICE'
+[Unit]
+Description=Remove clipboard file copies older than 24 hours
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/wsl-clipboard-session/stage-files --cleanup
+SERVICE
+    write_user_file "$service_dir/wsl-clipboard-cleanup.timer" 644 <<'TIMER'
+[Unit]
+Description=Hourly clipboard file cleanup
+[Timer]
+OnStartupSec=5min
+OnUnitActiveSec=1h
+[Install]
+WantedBy=timers.target
+TIMER
     user_systemctl daemon-reload
+    user_systemctl enable --now wsl-clipboard-cleanup.timer
     local legacy
     for legacy in xclip-bridge.service xclip-files-bridge.service; do
         if [[ $(user_systemctl show -p LoadState --value "$legacy") != not-found ]]; then
@@ -1112,7 +1290,7 @@ SERVICE
         fi
     done
     user_systemctl disable --now xclip-linux-files-bridge.service
-    if [[ $CLIPBOARD_MODE == desktop ]]; then
+    if [[ $CLIPBOARD_MODE == desktop || $CLIPBOARD_MODE == files ]]; then
         user_systemctl enable wsl-clipboard-desktop.service
         user_systemctl restart wsl-clipboard-desktop.service
     else
@@ -1122,7 +1300,7 @@ SERVICE
         files-out)
             user_systemctl enable --now xclip-linux-files-bridge.service
             ;;
-        native|session|desktop) ;;
+        native|session|desktop|files) ;;
     esac
     if [[ $INSTALL_CHINESE == true ]]; then
         user_systemctl enable wsl-fcitx5.service
@@ -1135,7 +1313,7 @@ SERVICE
         journalctl --user -u xclip-linux-files-bridge.service -n 20 --no-pager
         fail 'Linux 到 Windows 文件增强未持续运行。'
     fi
-    if [[ $CLIPBOARD_MODE == desktop ]] && ! user_systemctl is-active --quiet wsl-clipboard-desktop.service; then
+    if [[ $CLIPBOARD_MODE == desktop || $CLIPBOARD_MODE == files ]] && ! user_systemctl is-active --quiet wsl-clipboard-desktop.service; then
         journalctl --user -u wsl-clipboard-desktop.service -n 20 --no-pager
         fail '普通 WSLg 剪贴板数据提供程序未持续运行。'
     fi
@@ -1151,8 +1329,8 @@ main() {
     if [[ $DRY_RUN == true ]]; then
         printf '计划安装中文环境=%s，系统升级=%s\n' \
             "$([[ $INSTALL_CHINESE == true ]] && echo 是 || echo 否)" "$UPGRADE"
-        printf '剪贴板模式=%s（desktop=普通WSLg窗口；native=仅WSLg原生；files-out=Linux到Windows文件增强；session=独立窗口双向剪贴板）\n' "$CLIPBOARD_MODE"
-        printf '将安装 xclip 包和内嵌桥接源码；自动停止旧全量桥接，再按模式启用服务。\n'
+        printf '剪贴板模式=%s（files=默认双向文件；desktop=普通WSLg窗口；native=仅WSLg原生；files-out=Linux到Windows文件增强；session=独立窗口双向剪贴板）\n' "$CLIPBOARD_MODE"
+        printf '将保留原生 xclip，安装 wl-clipboard；增强桥接使用独立的 wsl-xclip 命令。\n'
         printf '已有配置备份至 ~/.local/state/wsl-ai-setup/backups。\n'
         printf '普通 WSLg 模式可直接运行 ai.opencode；独立窗口需显式选择 --opencode-session。\n'
         return
@@ -1162,8 +1340,9 @@ main() {
     install_packages
     configure_wsl
     if [[ $INSTALL_CHINESE == true ]]; then configure_chinese; fi
+    install_file_staging
     install_clipboard
-    if [[ $CLIPBOARD_MODE == session || $CLIPBOARD_MODE == desktop ]]; then install_file_session; fi
+    if [[ $CLIPBOARD_MODE == session || $CLIPBOARD_MODE == desktop || $CLIPBOARD_MODE == files ]]; then install_file_session; fi
     configure_services
     configure_opencode
     STEP=完成
@@ -1174,8 +1353,8 @@ main() {
     fi
     if [[ $CLIPBOARD_MODE == session ]]; then
         printf '启动双向剪贴板窗口：~/.local/bin/wsl-clipboard-app 程序名 [参数...]\n'
-    elif [[ $CLIPBOARD_MODE == desktop ]]; then
-        printf '普通 WSLg 剪贴板服务已启用，可直接运行 ai.opencode。\n'
+    elif [[ $CLIPBOARD_MODE == desktop || $CLIPBOARD_MODE == files ]]; then
+        printf '文件剪贴板服务已启用，可直接打开普通 WSLg X11 应用。\n'
     else
         printf '普通 WSLg 窗口使用原生剪贴板。双向文件粘贴可选 --file-session。\n'
     fi
