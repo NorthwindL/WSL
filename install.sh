@@ -1071,10 +1071,22 @@ function Test-WslgClipboardOwner { return (Test-WslgProcess ([ClipVersion]::Owne
 function Test-WslgForeground { return (Test-WslgProcess ([ClipVersion]::ForegroundProcessId())) }
 function Read-WindowsClipboard { return [Windows.Forms.Clipboard]::GetDataObject() }
 function Test-ExportFilePath([string]$path) {
-    # Windows FileDrop needs drive-absolute or UNC paths, never a POSIX path.
-    if ($path -notmatch '^(?:[A-Za-z]:[\/]|\\[^\]+\[^\]+(?:\|$))') { return $false }
-    if ($path -match '(?i)(?:^|[\/])\.cache[\/]wsl-clipboard[\/]files(?:[\/]|$)' -or
-        $path -match '(?i)(?:^|[\/])tmp[\/]chatgpt-clipboard\.') { return $false }
+    # Use path components rather than escaped regular expressions so the same
+    # checks work in Windows PowerShell 5.1 and PowerShell 7.
+    $separator = [char]92
+    $normalized = $path.Replace([char]47, $separator)
+    $components = $normalized.ToLowerInvariant().Split($separator)
+    $drive = $normalized.Length -ge 3 -and [char]::IsLetter($normalized[0]) -and
+        $normalized[1] -eq [char]58 -and $normalized[2] -eq $separator
+    $unc = $normalized.StartsWith(([string]$separator) * 2) -and $components.Count -ge 4 -and
+        $components[2].Length -gt 0 -and $components[3].Length -gt 0
+    if (!$drive -and !$unc) { return $false }
+    for ($i = 0; $i -lt $components.Count; $i++) {
+        if ($i + 2 -lt $components.Count -and $components[$i] -eq '.cache' -and
+            $components[$i + 1] -eq 'wsl-clipboard' -and $components[$i + 2] -eq 'files') { return $false }
+        if ($i + 1 -lt $components.Count -and $components[$i] -eq 'tmp' -and
+            $components[$i + 1].StartsWith('chatgpt-clipboard.')) { return $false }
+    }
     return $true
 }
 $window = New-Object Windows.Forms.Control
