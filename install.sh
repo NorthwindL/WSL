@@ -24,7 +24,7 @@ trap 'printf "\n安装在【%s】失败（第%s行）。修复报错后可重新
 usage() {
     cat <<'HELP'
 用法 bash install.sh [选项]
-默认启用双向文件桥接；文字、截图使用 WSLg 原生通道，默认安装中文环境和 Fcitx5，不安装独立桌面。
+默认启用双向文件桥接；Windows 文字直接桥接、截图使用 WSLg 原生通道，默认安装中文环境和 Fcitx5，不安装独立桌面。
   --dry-run         显示安装计划，保持系统当前状态
   --check           检查依赖和后台服务状态
   --with-chinese    安装中文字体、语言和 Fcitx5 输入法（默认）
@@ -822,7 +822,9 @@ int main(int argc, char **argv) {
     QGuiApplication app(argc, argv);
     if (argc != 3 && argc != 4) return 2;
     const bool filesOnly = argc == 4 && QByteArray(argv[3]) == "--files-only";
-    const bool desktop = filesOnly || (argc == 4 && QByteArray(argv[3]) == "--desktop");
+    const bool textFiles = argc == 4 && QByteArray(argv[3]) == "--text-files";
+    const bool filesBridge = filesOnly || textFiles;
+    const bool desktop = filesBridge || (argc == 4 && QByteArray(argv[3]) == "--desktop");
     if (argc == 4 && !desktop) return 2;
     QFile script(argv[2]);
     if (!script.open(QIODevice::ReadOnly)) return 1;
@@ -833,6 +835,7 @@ int main(int argc, char **argv) {
         src.prepend("$nativeDesktop = $true\n$desktopIdentity = '" + QString::fromLatin1(key) + "'\n");
     }
     if (filesOnly) src.prepend("$filesOnly = $true\n");
+    if (textFiles) src.prepend("$textFiles = $true\n");
     QByteArray encoded(reinterpret_cast<const char *>(src.utf16()), src.size()*2);
     QProcess host;
     host.setProcessChannelMode(QProcess::ForwardedErrorChannel);
@@ -861,17 +864,17 @@ int main(int argc, char **argv) {
     QByteArray seq = "-1";
     bool dirty = false, importing = false, busy = false;
     QObject::connect(clipboard, &QClipboard::dataChanged, [&] {
-        if ((!desktop || filesOnly) && !importing && !clipboard->ownsClipboard()) dirty = true;
+        if ((!desktop || filesBridge) && !importing && !clipboard->ownsClipboard()) dirty = true;
     });
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, [&] {
         if (busy) return;
         QScopedValueRollback<bool> processing(busy, true);
         bool retryExport = false;
-        if ((!desktop || filesOnly) && dirty && seq != "-1") {
+        if ((!desktop || filesBridge) && dirty && seq != "-1") {
             dirty = false;
-            QByteArray request = offer(clipboard->mimeData(), seq, filesOnly);
-            if (!request.isEmpty() && (!filesOnly || request.startsWith("FILES "))) {
+            QByteArray request = offer(clipboard->mimeData(), seq, filesBridge);
+            if (!request.isEmpty() && (!filesBridge || request.startsWith("FILES "))) {
                 auto reply = exchange(request);
                 if (reply.first() == "OK") { seq = reply.value(1); return; }
                 if (reply.first() == "ERROR") { dirty = true; return; }
@@ -886,7 +889,8 @@ int main(int argc, char **argv) {
         if (type == "ERROR" || type == "CHANGED") return;
         // A new external Windows selection wins over an outdated local offer.
         if (retryExport) dirty = false;
-        if (filesOnly && type != "FILES") { seq = version; return; }
+        if ((filesOnly && type != "FILES") ||
+            (textFiles && type != "TEXT" && type != "FILES")) { seq = version; return; }
         auto data = std::make_unique<QMimeData>();
         StagedFiles staging;
         if (type == "FILES") {
@@ -1025,8 +1029,10 @@ function Exchange([string]$request) {
         if ($data -and $data.GetDataPresent('FileDrop')) {
             $paths = @(foreach ($path in $data.GetData('FileDrop')) { Encode $path })
             $reply = "FILES $sequence " + ($paths -join ' ')
-        } elseif ($filesOnly) {
-            return "EMPTY $sequence"
+        } elseif ($textFiles -and $data -and $data.GetDataPresent('UnicodeText')) {
+            $reply = "TEXT $sequence " + (Encode ([string]$data.GetData('UnicodeText')))
+        } elseif ($filesOnly -or $textFiles) {
+            $reply = "EMPTY $sequence"
         } elseif ($data -and $data.GetDataPresent('PNG', $false)) {
             $stream = $data.GetData('PNG', $false)
             $reply = "IMAGE $sequence " + [Convert]::ToBase64String($stream.ToArray())
@@ -1213,7 +1219,7 @@ for socket in /run/WSL/1_interop /run/WSL/*_interop; do
         export WSL_INTEROP="$socket"
         exec "$HOME/.local/lib/wsl-clipboard-session/session" \
             /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
-            "$HOME/.local/lib/wsl-clipboard-session/backend.ps1" "${1:---files-only}"
+            "$HOME/.local/lib/wsl-clipboard-session/backend.ps1" "${1:---text-files}"
     fi
 done
 printf '未找到 WSL 互操作 socket\n' >&2
@@ -1224,7 +1230,7 @@ DESKTOP_START
 Description=Windows clipboard data for ordinary WSLg applications
 StartLimitIntervalSec=0
 [Service]
-ExecStart=%h/.local/bin/wsl-clipboard-desktop-start --$([[ $CLIPBOARD_MODE == desktop ]] && echo desktop || echo files-only)
+ExecStart=%h/.local/bin/wsl-clipboard-desktop-start --$([[ $CLIPBOARD_MODE == desktop ]] && echo desktop || echo text-files)
 Environment="DISPLAY=$DISPLAY"
 Environment="WSL_DISTRO_NAME=$WSL_DISTRO_NAME"
 Environment=QT_QPA_PLATFORM=xcb
@@ -1335,7 +1341,7 @@ main() {
     if [[ $DRY_RUN == true ]]; then
         printf '计划安装中文环境=%s，系统升级=%s\n' \
             "$([[ $INSTALL_CHINESE == true ]] && echo 是 || echo 否)" "$UPGRADE"
-        printf '剪贴板模式=%s（files=默认双向文件；desktop=普通WSLg窗口；native=仅WSLg原生；files-out=Linux到Windows文件增强；session=独立窗口双向剪贴板）\n' "$CLIPBOARD_MODE"
+        printf '剪贴板模式=%s（files=文字直连及双向文件；desktop=普通WSLg窗口；native=仅WSLg原生；files-out=Linux到Windows文件增强；session=独立窗口双向剪贴板）\n' "$CLIPBOARD_MODE"
         printf '将保留原生 xclip，安装 wl-clipboard；增强桥接使用独立的 wsl-xclip 命令。\n'
         printf '已有配置备份至 ~/.local/state/wsl-ai-setup/backups。\n'
         printf '普通 WSLg 模式可直接运行 ai.opencode；独立窗口需显式选择 --opencode-session。\n'
@@ -1360,7 +1366,7 @@ main() {
     if [[ $CLIPBOARD_MODE == session ]]; then
         printf '启动双向剪贴板窗口：~/.local/bin/wsl-clipboard-app 程序名 [参数...]\n'
     elif [[ $CLIPBOARD_MODE == desktop || $CLIPBOARD_MODE == files ]]; then
-        printf '文件剪贴板服务已启用，可直接打开普通 WSLg X11 应用。\n'
+        printf 'Windows 文字直连及文件剪贴板服务已启用，可直接打开普通 WSLg X11 应用。\n'
     else
         printf '普通 WSLg 窗口使用原生剪贴板。双向文件粘贴可选 --file-session。\n'
     fi

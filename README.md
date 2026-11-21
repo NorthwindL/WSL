@@ -7,14 +7,15 @@ curl -fL --retry 3 https://raw.githubusercontent.com/NorthwindL/WSL/main/install
 bash /tmp/wsl-ai-install.sh
 ```
 
-安装时按提示输入 Linux 用户的 sudo 密码。默认启用双向文件桥接，文字和截图使用 WSLg 原生剪贴板。默认安装中文字体、中文语言环境、Fcitx5 中文输入法及配置工具（fcitx5-configtool），不安装独立桌面，不修改应用的显示后端。安装后退出并重新打开目标应用。
+安装时按提示输入 Linux 用户的 sudo 密码。默认启用 Windows → WSLg 文字直连和双向文件桥接，截图使用 WSLg 原生剪贴板。默认安装中文字体、中文语言环境、Fcitx5 中文输入法及配置工具（fcitx5-configtool），不安装独立桌面，不修改应用的显示后端。安装后退出并重新打开目标应用。
 
 ## 默认行为
 
 | 内容 | 实现方式 |
 |---|---|
 | 中文环境与输入法 | 默认安装中文字体、zh_CN.UTF-8、Fcitx5、拼音和配置工具 |
-| 中文文字、多行、emoji | 使用 WSLg 原生通道，保留原生 xclip 的选择区和参数行为 |
+| Windows → WSLg 中文文字、多行、emoji | 从 Windows UnicodeText 读取，经 UTF-8 / Base64 传输并发布至 X11；CRLF 转为 LF，保留空白与末尾换行 |
+| WSLg → Windows 文字 | 使用 WSLg 原生通道，保留原生 xclip 的选择区和参数行为 |
 | Windows 截图 | 使用 WSLg 原生图片通道；安装 wl-copy / wl-paste 便于操作 Wayland 剪贴板 |
 | Windows → WSLg 文件 | 后台服务读取 Windows 磁盘文件列表，完成受限复制后向当前 X11 剪贴板发布 text/uri-list |
 | WSLg → Windows 文件 | 后台服务读取 X11 文件 URI，通过 WSL 共享路径发布 Windows FileDrop；不复制文件内容到控制台 |
@@ -25,7 +26,7 @@ bash /tmp/wsl-ai-install.sh
 
 文件复制拒绝符号链接（含目录内部链接）、设备与其他特殊文件。文件全部复制成功后才发布路径，失败则移除本次副本并保留现有应用剪贴板。同名文件放在不同子目录；中文、空格、emoji 和换行文件名通过 JSON 或 NUL 协议传递。文件桥接不转换普通文本路径。
 
-文件桥接覆盖 **WSLg X11 应用**，粘贴目标须支持文件 URI，例如文件管理器或支持附件粘贴的编辑器。原生 Wayland 应用是否接受跨系统文件取决于其自身及 WSLg 支持，当前文件桥接不覆盖其 Wayland 选择区。文字和截图的原生能力同样取决于目标应用支持的剪贴板格式，安装工具本身不保证所有应用的兼容性。
+文字直连和文件桥接覆盖 **WSLg X11 应用**，粘贴目标须支持文件 URI，例如文件管理器或支持附件粘贴的编辑器。原生 Wayland 应用是否接受跨系统文件取决于其自身及 WSLg 支持，当前文件桥接不覆盖其 Wayland 选择区。文字和截图的原生能力同样取决于目标应用支持的剪贴板格式，安装工具本身不保证所有应用的兼容性。
 
 Windows 虚拟文件对象（如部分邮件附件）未实现 IStream 协议，目前支持磁盘文件与目录。反向粘贴时需保持 WSL 发行版运行、源文件可访问。暂存副本会在 24 小时后清理，长期使用的文件应及时另存。
 
@@ -35,7 +36,7 @@ Windows 虚拟文件对象（如部分邮件附件）未实现 IStream 协议，
 # 预览安装计划（不修改系统）
 bash /tmp/wsl-ai-install.sh --dry-run
 
-# 默认：中文环境、Fcitx5 和双向文件桥接；文字与截图走 WSLg 原生通道
+# 默认：中文环境、Fcitx5 和双向文件桥接；Windows 文字直接桥接，截图走 WSLg 原生通道
 bash /tmp/wsl-ai-install.sh
 
 # 跳过中文字体、语言和 Fcitx5 安装
@@ -61,7 +62,7 @@ bash /tmp/wsl-ai-install.sh --opencode-session
 bash /tmp/wsl-ai-install.sh --upgrade
 ```
 
-`--with-files` 等同默认双向文件模式。`--files-out` 保留单向 Linux → Windows 文件模式。`--opencode-wayland` 是旧版独立窗口参数的兼容别名。增强模式的图片读取沿用 PNG 优先、Bitmap 转 PNG 的逻辑；普通文件模式不读取或重发布文字、图片。
+`--with-files` 等同默认双向文件模式。`--files-out` 保留单向 Linux → Windows 文件模式。`--opencode-wayland` 是旧版独立窗口参数的兼容别名。增强模式的图片读取沿用 PNG 优先、Bitmap 转 PNG 的逻辑；默认模式直接读取并发布 Windows UnicodeText 和文件，不重发布图片；Linux 文字反向复制仍走原生通道。
 
 `--file-session` 仅在显式选择时安装 Xephyr 和 Openbox，启动器要求前台应用实例。单实例程序应选择独立实例参数。默认模式直接打开普通 WSLg 应用。
 
@@ -72,6 +73,10 @@ bash /tmp/wsl-ai-install.sh --upgrade
 若 PID 1 不是 systemd，安装器会合并 /etc/wsl.conf 的 systemd 与互操作设置，保留其他键，以状态码 2 退出。保存工作后，在 Windows 终端运行 `wsl -t <发行版名>`，再运行 `wsl -d <发行版名>`，然后重新执行安装命令。systemd 用户总线必须可用。
 
 已有被修改配置备份至 `~/.local/state/wsl-ai-setup/backups/时间-进程号/`。重复安装会按所选模式管理桥接服务。默认生成 zh_CN.UTF-8 并设置系统默认 LANG，配置 Fcitx5；已有输入法 profile 保留。安装完成后重新进入 WSL 用户会话，并重新打开应用；可运行 `fcitx5-configtool` 调整输入法。`--with-chinese` 保留为显式启用参数；`--without-chinese` 跳过中文安装，但不会卸载已有软件或删除其环境变量。
+
+## Windows 文字粘贴修复
+
+如果旧版从 Windows 复制中文后，在 WSLg 应用里粘贴失败或仍是旧内容，重新下载并运行安装器，随后完全退出并重新打开目标应用。默认服务现在直接读取 Windows UnicodeText，不再仅依赖 WSLg 的文字导入。双向文件桥接和中文环境继续默认启用。Qt 向 X11 提供标准文本目标，不替换原生 xclip。
 
 ## 验证与排查
 

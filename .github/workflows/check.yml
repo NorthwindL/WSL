@@ -6,7 +6,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Qt build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qtbase5-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qtbase5-dev xvfb xauth xclip
       - name: Check installer and staging
         run: |
           bash -n install.sh
@@ -19,3 +19,5 @@ jobs:
           Path('/tmp/session.cpp').write_text(source)
           PY
           g++ -std=c++17 -Wall -Wextra -O2 -fPIC /tmp/session.cpp -o /tmp/session $(pkg-config --cflags --libs Qt5Gui)
+      - name: Verify text delivery through X11
+        run: QT_BRIDGE_BINARY=/tmp/session xvfb-run -a python3 -m unittest discover -s tests -p test_clipboard_integration.py -v
