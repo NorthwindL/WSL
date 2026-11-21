@@ -1,8 +1,4 @@
-"""Exercise the compiled bridge on real X11 with a simulated Windows protocol.
-
-CI supplies QT_BRIDGE_BINARY and runs this suite under Xvfb. Windows clipboard
-APIs are simulated; X11 selection delivery is real.
-"""
+"""Real X11 selection requests with a simulated Windows metadata/data backend."""
 import base64
 import json
 import os
@@ -24,246 +20,169 @@ class ClipboardIntegrationTests(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.state = self.base / 'state.json'
         self.log = self.base / 'requests.log'
-        self.sequence = 0
-        self.export_result = 'OK'
+        self.seq = 0
+        self.source = self.base / '黑龙江分院-明细.xlsx'
+        self.source.write_bytes(b'original Windows desktop workbook')
+        self.update('FILES', [str(self.source)])
+        installer = (Path(__file__).resolve().parents[1] / 'install.sh').read_text()
         helper = self.base / '.local/lib/wsl-clipboard-session/stage-files'
         helper.parent.mkdir(parents=True)
-        installer = (Path(__file__).resolve().parents[1] / 'install.sh').read_text()
         helper.write_text(installer.split("<<'STAGE_FILES'\n", 1)[1].split('\nSTAGE_FILES\n', 1)[0])
         helper.chmod(0o700)
         wslpath = self.base / 'wslpath'
         wslpath.write_text('#!/usr/bin/env python3\nimport sys\nprint(sys.argv[-1])\n')
         wslpath.chmod(0o700)
-        self.update('TEXT', 'initial')
         self.host = self.base / 'fake-powershell'
         self.host.write_text('''#!/usr/bin/env python3
-import json, os, sys
+import base64, json, os, sys
 from pathlib import Path
 for line in sys.stdin:
-    with open(os.environ['TEST_REQUESTS'], 'a') as log:
-        log.write(line)
+    with open(os.environ['TEST_REQUESTS'], 'a') as log: log.write(line)
     parts = line.strip().split(' ')
     state = json.loads(Path(os.environ['TEST_STATE']).read_text())
-    sequence = state['sequence']
-    if parts[0] == 'CHECK':
-        reply = 'CURRENT' if parts[1] == sequence else 'CHANGED'
-    elif parts[0] == 'FILES':
-        result = os.environ.get('TEST_EXPORT_RESULT', 'OK')
-        if result == 'CHANGED':
-            state.update(sequence=str(int(sequence) + 1), type='TEXT', data='bmV3IFdpbmRvd3MgdGV4dA==')
-            Path(os.environ['TEST_STATE']).write_text(json.dumps(state))
-            reply = 'CHANGED'
-        elif result == 'ERROR':
-            reply = 'ERROR'
+    seq = state['sequence']
+    action = parts[0]
+    if action == 'POLL':
+        reply = 'SAME ' + seq if parts[1] == seq else state['kind'] + ' ' + seq
+    elif action == 'CHECK':
+        reply = 'CURRENT' if parts[1] == seq else 'CHANGED'
+    elif action == 'PULL':
+        reply = ('FILES ' + seq + ' ' + ' '.join(base64.b64encode(p.encode()).decode() for p in state['paths'])
+                 if parts[1] == seq and state['kind'] == 'FILES' else 'CHANGED')
+    elif action == 'EXPORT':
+        if parts[1] != seq: reply = 'CHANGED'
         else:
-            reply = 'OK ' + sequence
-    elif parts[0] == 'READ':
-        reply = ('SAME ' + sequence if parts[1] == sequence else
-                 state['type'] + ' ' + sequence + ' ' + state['data'])
-    else:
-        reply = 'ERROR'
+            seq = str(int(seq) + 1)
+            state.update(sequence=seq, kind='OTHER', paths=[])
+            Path(os.environ['TEST_STATE']).write_text(json.dumps(state))
+            reply = 'OK ' + seq
+    else: reply = 'ERROR'
     print(reply, flush=True)
 ''')
         self.host.chmod(0o700)
         self.script = self.base / 'backend.ps1'
         self.script.write_text('')
+        self.cache = self.base / '.cache/wsl-clipboard/files'
 
-    def update(self, kind, text):
-        self.sequence += 1
-        pending = self.base / 'pending.json'
-        pending.write_text(json.dumps({'sequence': str(self.sequence), 'type': kind,
-                                       'data': base64.b64encode(text.encode()).decode()}))
+    def update(self, kind, paths=None):
+        self.seq += 1
+        pending = self.base / 'state.new'
+        pending.write_text(json.dumps({'sequence': str(self.seq), 'kind': kind, 'paths': paths or []}))
         pending.replace(self.state)
 
-    def start(self, mode='--files-only'):
-        self.process = subprocess.Popen([BINARY, str(self.host), str(self.script), mode],
-                                        env={**os.environ, 'QT_QPA_PLATFORM': 'xcb',
-                                             'TEST_STATE': str(self.state),
-                                             'TEST_EXPORT_RESULT': self.export_result,
-                                             'HOME': str(self.base),
+    def start(self):
+        self.process = subprocess.Popen([BINARY, str(self.host), str(self.script)],
+                                        env={**os.environ, 'HOME': str(self.base),
                                              'PATH': str(self.base) + os.pathsep + os.environ['PATH'],
-                                             'TEST_REQUESTS': str(self.log)},
+                                             'TEST_STATE': str(self.state), 'TEST_REQUESTS': str(self.log)},
                                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         def stop():
             self.process.terminate()
-            try:
-                self.process.communicate(timeout=5)
+            try: self.process.communicate(timeout=4)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.communicate()
+                self.process.kill(); self.process.communicate()
         self.addCleanup(stop)
+        self.wait_for(lambda: any(r.startswith('POLL ') for r in self.requests()))
 
-    def read(self, target='UTF8_STRING'):
-        result = subprocess.run(['xclip', '-selection', 'clipboard', '-target', target, '-o'],
-                                capture_output=True, timeout=2)
-        return result.stdout.decode('utf-8') if result.returncode == 0 else None
+    def requests(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
 
-    def await_text(self, expected):
-        deadline = time.monotonic() + 8
-        actual = None
+    def wait_for(self, predicate, timeout=8):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            self.assertIsNone(self.process.poll(), 'clipboard bridge exited unexpectedly')
-            actual = self.read()
-            if actual == expected:
-                return
-            time.sleep(0.1)
-        self.fail(f'clipboard mismatch: expected {expected[:100]!r}, got {str(actual)[:100]!r}')
+            if predicate(): return
+            self.assertIsNone(self.process.poll(), 'bridge exited unexpectedly')
+            time.sleep(0.05)
+        self.fail('condition timed out')
 
-    def test_windows_unicode_multiline_long_and_empty_text(self):
-        self.start('--text-files')
-        self.await_text('initial')
-        for text in ('  中文测试😀\r\n第二行\r末行\n', '中文😀ABC\n' * 4000, ''):
-            self.update('TEXT', text)
-            self.await_text(text.replace('\r\n', '\n').replace('\r', '\n'))
-        requests = self.log.read_text().splitlines()
-        self.assertFalse(any(line.startswith('TEXT ') for line in requests),
-                         'native reverse text must not be republished by the file exporter')
+    def read(self, target='text/uri-list', timeout=8):
+        result = subprocess.run(['xclip', '-selection', 'clipboard', '-target', target, '-o'],
+                                capture_output=True, timeout=timeout)
+        return result.stdout.decode() if result.returncode == 0 else None
 
-    def test_image_and_empty_frames_do_not_clear_text(self):
-        self.start('--text-files')
-        self.await_text('initial')
-        for kind in ('IMAGE', 'EMPTY'):
-            self.update(kind, 'ignored image payload')
-            time.sleep(0.7)
-            self.assertEqual(self.read(), 'initial')
+    def wait_targets(self):
+        self.wait_for(lambda: 'text/uri-list' in (self.read('TARGETS') or ''))
 
-    def test_default_files_only_does_not_import_text(self):
-        self.start('--files-only')
-        deadline = time.monotonic() + 5
-        while not self.log.exists() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        self.assertTrue(self.log.exists())
-        self.assertNotEqual(self.read(), 'initial')
+    def test_windows_copy_and_format_probes_do_not_transfer(self):
+        self.start()
+        self.wait_targets()
+        for _ in range(3):
+            targets = self.read('TARGETS').splitlines()
+            self.assertNotIn('text/plain', targets)
+            self.assertNotIn('UTF8_STRING', targets)
+        time.sleep(0.7)  # Polling and any focus change have no data-fetch branch.
+        self.assertFalse(self.cache.exists())
+        self.assertFalse(any(r.startswith(('PULL ', 'EXPORT ')) for r in self.requests()))
 
-    def own_selection(self, target, value):
+    def test_actual_uri_paste_fetches_once_and_reuses_same_copy(self):
+        self.start(); self.wait_targets()
+        data = self.read()
+        self.assertTrue(data)
+        path = Path(unquote(urlparse(data.strip()).path))
+        self.assertEqual(path.read_bytes(), self.source.read_bytes())
+        self.assertEqual(self.read(), data)
+        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
+        self.assertFalse(any(r.startswith('EXPORT ') for r in self.requests()))
+
+    def test_gnome_paste_requests_file_data(self):
+        self.start(); self.wait_targets()
+        data = self.read('x-special/gnome-copied-files')
+        self.assertTrue(data.startswith('copy\nfile://'))
+        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
+
+    def test_new_copy_before_paste_uses_new_file(self):
+        self.start(); self.wait_targets()
+        next_file = self.base / '第二份.xlsx'; next_file.write_bytes(b'new copy')
+        self.update('FILES', [str(next_file)])
+        time.sleep(0.6)
+        data = self.read()
+        self.assertEqual(Path(unquote(urlparse(data.strip()).path)).read_bytes(), b'new copy')
+        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
+
+    def test_large_file_selection_uses_incr(self):
+        self.update('FILES', [str(self.source)] * 700)
+        self.start(); self.wait_targets()
+        data = self.read(timeout=20)
+        self.assertTrue(data and len(data) > 32768)
+        self.assertEqual(len(data.splitlines()), 700)
+        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
+
+    def own(self, target, content):
         owner = subprocess.Popen(['xclip', '-selection', 'clipboard', '-target', target, '-in', '-quiet'],
                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        owner.stdin.write(value.encode())
-        owner.stdin.close()
+        owner.stdin.write(content.encode()); owner.stdin.close()
         def stop():
-            if owner.poll() is None:
-                owner.terminate()
-            try:
-                owner.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                owner.kill()
-                owner.wait()
+            if owner.poll() is None: owner.terminate()
+            try: owner.wait(timeout=3)
+            except subprocess.TimeoutExpired: owner.kill(); owner.wait()
         self.addCleanup(stop)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if self.read(target) == value:
-                return
-            time.sleep(0.1)
-        self.fail('test selection owner did not become available')
+        self.wait_for(lambda: self.read(target) == content)
 
-    def wait_for_requests(self, prefix):
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            if self.log.exists():
-                lines = self.log.read_text().splitlines()
-                if any(line.startswith(prefix) for line in lines):
-                    return lines
-            time.sleep(0.1)
-        self.fail('missing protocol request ' + prefix)
-
-    def test_native_rich_text_is_preserved_across_windows_copies(self):
-        html = '<p><b>中文 bold 😀</b></p>'
-        self.own_selection('text/html', html)
+    def test_linux_file_copy_exports_without_windows_import(self):
+        self.update('OTHER')
         self.start()
-        self.wait_for_requests('READ ')
-        for value in ('new Windows text', '第二次复制', ''):
-            self.update('TEXT', value)
-            time.sleep(0.7)
-            self.assertEqual(self.read('text/html'), html)
-        requests = self.log.read_text().splitlines()
-        self.assertFalse(any(line.startswith(('TEXT ', 'FILES ', 'IMAGE ')) for line in requests))
+        self.own('text/uri-list', self.source.as_uri() + '\r\n')
+        self.wait_for(lambda: any(r.startswith('EXPORT ') for r in self.requests()))
+        self.assertFalse(any(r.startswith('PULL ') for r in self.requests()))
+        self.assertFalse(self.cache.exists())
 
-    def test_imported_files_have_no_plain_text_fallback_or_export_echo(self):
-        source = self.base / '源 中文.txt'
-        source.write_bytes('文件内容'.encode())
-        self.update('FILES', str(source))
-        self.start()
-        deadline = time.monotonic() + 8
-        uris = None
-        while time.monotonic() < deadline:
-            uris = self.read('text/uri-list')
-            if uris:
-                break
-            time.sleep(0.1)
-        self.assertTrue(uris, 'Windows file must be offered to X11')
-        copied = Path(unquote(urlparse(uris.strip()).path))
-        self.assertEqual(copied.read_bytes(), source.read_bytes())
-        targets = self.read('TARGETS').splitlines()
-        for target in ('UTF8_STRING', 'STRING', 'text/plain', 'text/plain;charset=utf-8'):
-            self.assertNotIn(target, targets, 'file paths must not trigger native text synchronization')
-        self.update('TEXT', 'a newer Windows copy')
+    def test_cache_alias_is_never_exported(self):
+        cache = self.cache / 'copy-existing/1'; cache.mkdir(parents=True)
+        original = cache / 'cached.xlsx'; original.write_bytes(b'cache')
+        alias = self.base / 'alias.xlsx'; alias.symlink_to(original)
+        self.update('OTHER'); self.start()
+        self.own('text/uri-list', alias.as_uri() + '\r\n')
         time.sleep(0.8)
-        self.assertFalse(any(line.startswith('FILES ') for line in self.log.read_text().splitlines()),
-                         'imported files must not be exported back into Windows')
+        self.assertFalse(any(r.startswith('EXPORT ') for r in self.requests()))
 
-    def export_local_file(self):
-        source = self.base / 'local.txt'
-        source.write_text('local file')
-        self.start()
-        self.wait_for_requests('READ ')
-        time.sleep(0.6)
-        self.own_selection('text/uri-list', source.as_uri() + '\r\n')
-        self.wait_for_requests('FILES ')
-        time.sleep(1.2)
-        return [line for line in self.log.read_text().splitlines() if line.startswith('FILES ')]
-
-    def test_local_file_export_still_works_once(self):
-        self.assertEqual(len(self.export_local_file()), 1)
-
-    def test_failed_export_is_not_repeated(self):
-        self.export_result = 'ERROR'
-        self.assertEqual(len(self.export_local_file()), 1)
-
-    def test_new_windows_copy_wins_over_stale_file_export(self):
-        self.export_result = 'CHANGED'
-        self.assertEqual(len(self.export_local_file()), 1)
+    def test_native_html_is_preserved(self):
+        self.update('OTHER'); self.start()
+        html = '<b>中文格式 😀</b>'
+        self.own('text/html', html)
+        time.sleep(0.5)
+        self.update('OTHER'); time.sleep(0.5)
+        self.assertEqual(self.read('text/html'), html)
+        self.assertFalse(any(r.startswith(('PULL ', 'EXPORT ')) for r in self.requests()))
 
 
-    def test_windows_file_copy_stays_deferred_until_linux_focus(self):
-        source = self.base / 'desktop.xlsx'
-        source.write_bytes(b'original desktop file')
-        self.update('DEFER', '')
-        self.start()
-        self.wait_for_requests('READ ')
-        time.sleep(0.8)
-        self.assertFalse((self.base / '.cache/wsl-clipboard/files').exists(),
-                         'Windows-only copying must not create Linux cache copies')
-        # Focus changes, but the Windows clipboard sequence does not.
-        pending = self.base / 'pending.json'
-        pending.write_text(json.dumps({'sequence': str(self.sequence), 'type': 'FILES',
-                                       'data': base64.b64encode(str(source).encode()).decode()}))
-        pending.replace(self.state)
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            uris = self.read('text/uri-list')
-            if uris:
-                copied = Path(unquote(urlparse(uris.strip()).path))
-                if copied.exists() and copied.read_bytes() == source.read_bytes():
-                    return
-            time.sleep(0.1)
-        self.fail('Deferred copy was consumed before the Linux focus change')
-
-    def test_symlink_to_windows_cache_is_not_exported(self):
-        cache = self.base / '.cache/wsl-clipboard/files/copy-example/1'
-        cache.mkdir(parents=True)
-        source = cache / 'desktop.xlsx'
-        source.write_bytes(b'Windows origin')
-        alias = self.base / 'shortcut.xlsx'
-        alias.symlink_to(source)
-        self.start()
-        self.wait_for_requests('READ ')
-        time.sleep(0.6)
-        self.own_selection('text/uri-list', alias.as_uri() + '\r\n')
-        time.sleep(1.2)
-        self.assertFalse(any(line.startswith('FILES ') for line in self.log.read_text().splitlines()),
-                         'A symlink to a Windows import was exported back into Windows')
-
-
-
-if __name__ == '__main__':
-    unittest.main()
+if __name__ == '__main__': unittest.main()

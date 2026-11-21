@@ -99,8 +99,7 @@ class StagingTests(unittest.TestCase):
 class InstallerTests(unittest.TestCase):
     def test_default_and_mode_plans(self):
         script = Path(__file__).resolve().parents[1] / 'install.sh'
-        for args, mode in [([], 'files'), (['--native'], 'native'),
-                           (['--file-session'], 'session'), (['--desktop-bridge'], 'desktop')]:
+        for args, mode in [([], 'files'), (['--native'], 'native'), (['--with-files'], 'files')]:
             output = subprocess.check_output(['bash', str(script), '--dry-run', *args], text=True)
             self.assertIn('剪贴板模式=' + mode, output)
             self.assertIn('中文环境=是', output)
@@ -112,7 +111,7 @@ class InstallerTests(unittest.TestCase):
             self.assertIn('剪贴板模式=files', output)
 
     def test_all_embedded_shell_scripts_parse(self):
-        for marker in ('XCLIP_SOURCE', 'SESSION_LAUNCH', 'DIRECT', 'OPENCODE', 'START', 'DESKTOP_START'):
+        for marker in ('DIRECT', 'DIRECT_APP', 'DESKTOP_START'):
             subprocess.run(['bash', '-n'], input=embedded(marker), text=True, check=True)
 
 

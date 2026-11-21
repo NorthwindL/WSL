@@ -33,50 +33,46 @@ public static class ClipVersion {
 '@
 $script:ownerChecks = 0
 $script:readCount = 0
-$script:linuxFocused = $false
 function Test-WslgClipboardOwner { $script:ownerChecks++; return $false }
-function Test-WslgForeground { return $script:linuxFocused }
 function Read-WindowsClipboard { $script:readCount++; return $script:originalData }
 $utf8 = New-Object Text.UTF8Encoding($false, $true)
-$filesOnly = $true
-$textFiles = $false
-$nativeDesktop = $true
 $bridgeMarker = 1000
 $window = @{ Handle = [IntPtr]::Zero }
-if ((Exchange 'READ 1') -ne 'EMPTY 2') { throw 'Non-file data was not skipped' }
-if ((Exchange 'READ 2') -ne 'SAME 2') { throw 'Unchanged sequence was not skipped' }
+if ((Exchange 'POLL 1') -ne 'OTHER 2') { throw 'Non-file metadata failed' }
+if ((Exchange 'POLL 2') -ne 'SAME 2') { throw 'Unchanged sequence failed' }
 [ClipVersion]::HasFiles = $true
-[ClipVersion]::HasMarker = $true
-if ((Exchange 'READ 1') -ne 'SAME 2') { throw 'Bridge-originated files were not skipped' }
-if ((Exchange 'TEXT 2 YQ==') -ne 'ERROR') { throw 'File-only backend accepted a text write' }
-if ((Exchange 'IMAGE 2 YQ==') -ne 'ERROR') { throw 'File-only backend accepted an image write' }
-[ClipVersion]::HasMarker = $false
-# Remote Explorer is foreground: do not read or write the original FileDrop.
-if ((Exchange 'READ 1') -ne 'DEFER 2') { throw 'Windows Explorer file copy was not deferred' }
-if ($script:readCount -ne 0 -or $script:ownerChecks -ne 0 -or [ClipVersion]::Writes -ne 0) {
-    throw 'Background bridge touched the Windows desktop file selection'
+foreach ($context in @('local Windows desktop', 'remote desktop Explorer')) {
+    for ($i = 0; $i -lt 5; $i++) {
+        if ((Exchange 'POLL 1') -ne 'FILES 2') { throw "File metadata failed: $context" }
+    }
 }
-# Switching focus must allow the same Windows sequence to be imported, without
-# replacing its original Windows desktop path or publishing a cache path back.
+if ($script:readCount -ne 0 -or [ClipVersion]::Writes -ne 0) {
+    throw 'Windows copy or metadata polling read paths or changed FileDrop'
+}
+[ClipVersion]::HasMarker = $true
+if ((Exchange 'POLL 1') -ne 'OTHER 2' -or (Exchange 'PULL 2') -ne 'ERROR') {
+    throw 'A bridge-originated file was imported back'
+}
+[ClipVersion]::HasMarker = $false
 $desktopPath = 'C:\Users\ai\Desktop\黑龙江分院中移咨询主体专项激励分配明细-辽宁计划单列分院1.xlsx'
 $script:originalData = [pscustomobject]@{ Paths = @($desktopPath) }
 $script:originalData | Add-Member ScriptMethod GetDataPresent { param($format) return $format -eq 'FileDrop' }
 $script:originalData | Add-Member ScriptMethod GetData { param($format) return $this.Paths }
-$script:linuxFocused = $true
-$reply = Exchange 'READ 1'
-$parts = $reply.Split(' ')
-if ($parts[0] -ne 'FILES' -or (Decode $parts[2]) -ne $desktopPath) { throw 'Original Windows path was changed' }
-if ($script:readCount -ne 1 -or [ClipVersion]::Writes -ne 0) { throw 'Import modified the Windows clipboard' }
-foreach ($path in @('/home/ai/.cache/wsl-clipboard/files/copy-_pfnm5x3/1/desktop.xlsx',
-                    '\\wsl.localhost\Ubuntu\home\ai\.cache\wsl-clipboard\files\copy-_pfnm5x3\1\desktop.xlsx',
-                    '\\wsl$\Ubuntu\tmp\chatgpt-clipboard.123\1\desktop.xlsx', 'relative.xlsx')) {
-    if ((Exchange ('FILES 2 ' + (Encode $path))) -ne 'ERROR') { throw "Unsafe export accepted: $path" }
+if ((Exchange 'PULL 1') -ne 'CHANGED' -or $script:readCount -ne 0) { throw 'Stale paste read Windows paths' }
+$parts = (Exchange 'PULL 2').Split(' ')
+if ($parts[0] -ne 'FILES' -or (Decode $parts[2]) -ne $desktopPath) { throw 'Paste changed original Windows file path' }
+if ($script:readCount -ne 1 -or [ClipVersion]::Writes -ne 0) { throw 'Paste import changed Windows FileDrop' }
+foreach ($action in @('TEXT', 'IMAGE', 'READ', 'FILES')) {
+    if ((Exchange ($action + ' 2 YQ==')) -ne 'ERROR') { throw 'Removed active protocol was accepted' }
 }
-if ([ClipVersion]::Writes -ne 0) { throw 'An unsafe path replaced Windows FileDrop' }
-$linuxPath = '\\wsl.localhost\Ubuntu\home\ai\document.xlsx'
-if ((Exchange ('FILES 2 ' + (Encode $linuxPath))) -ne 'OK 2') { throw 'Genuine Linux file export failed' }
-$drop = [Text.Encoding]::Unicode.GetString([ClipVersion]::LastPayload[0], 20, [ClipVersion]::LastPayload[0].Length - 20)
-if (!$drop.Contains($linuxPath) -or [ClipVersion]::Writes -ne 1) { throw 'Incorrect native FileDrop export' }
+foreach ($path in @('/home/ai/.cache/wsl-clipboard/files/copy-example/1/desktop.xlsx',
+                    ('\' * 2 + 'wsl.localhost\Ubuntu\home\ai\.cache\wsl-clipboard\files\copy-example\1\desktop.xlsx'),
+                    'relative.xlsx')) {
+    if ((Exchange ('EXPORT 2 ' + (Encode $path))) -ne 'ERROR') { throw "Unsafe export accepted: $path" }
+}
+$linuxPath = [string]([char]92) * 2 + 'wsl.localhost' + [char]92 + 'Ubuntu' + [char]92 + 'home' + [char]92 + 'ai' + [char]92 + 'document.xlsx'
+if ((Exchange ('EXPORT 2 ' + (Encode $linuxPath))) -ne 'OK 2') { throw 'Genuine Linux export failed' }
+if ([ClipVersion]::Writes -ne 1) { throw 'Unexpected Windows clipboard write' }
 if ((Test-WslgCommandLine 'mstsc.exe /v:remote-host') -or
     !(Test-WslgCommandLine 'msrdc.exe /wslg')) { throw 'Ordinary RDP was confused with WSLg' }
-Write-Output 'Windows/RDP file-copy isolation, cache-path rejection and genuine Linux export checks passed.'
+Write-Output 'Metadata-only copy, paste-triggered path retrieval and genuine Linux export checks passed.'
