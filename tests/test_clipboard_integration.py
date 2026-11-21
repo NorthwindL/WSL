@@ -184,5 +184,25 @@ for line in sys.stdin:
         self.assertEqual(self.read('text/html'), html)
         self.assertFalse(any(r.startswith(('PULL ', 'EXPORT ')) for r in self.requests()))
 
+    def test_gnome_only_linux_copy_exports(self):
+        self.update('OTHER'); self.start()
+        self.own('x-special/gnome-copied-files', 'copy\n' + self.source.as_uri())
+        self.wait_for(lambda: any(r.startswith('EXPORT ') for r in self.requests()))
+        self.assertFalse(any(r.startswith('PULL ') for r in self.requests()))
+
+    def test_new_windows_copy_cancels_an_inflight_paste(self):
+        helper = self.base / '.local/lib/wsl-clipboard-session/stage-files'
+        helper.write_text(helper.read_text().replace('def main():', 'def main():\n    time.sleep(1)'))
+        self.start(); self.wait_targets()
+        reader = subprocess.Popen(['xclip', '-selection', 'clipboard', '-target', 'text/uri-list', '-o'],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: reader.kill() if reader.poll() is None else None)
+        self.wait_for(lambda: any(r.startswith('PULL ') for r in self.requests()))
+        self.update('OTHER')
+        stdout, _ = reader.communicate(timeout=8)
+        self.assertEqual(stdout, b'')
+        self.assertFalse(self.cache.exists())
+
+
 
 if __name__ == '__main__': unittest.main()

@@ -11,7 +11,7 @@ jobs:
         run: |
           bash -n install.sh
           python3 -m unittest discover -s tests -v
-      - name: Compile embedded Qt clipboard bridge
+      - name: Compile QtCore/X11 file bridge
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -19,7 +19,7 @@ jobs:
           Path('/tmp/session.cpp').write_text(source)
           PY
           g++ -std=c++17 -Wall -Wextra -O2 -fPIC /tmp/session.cpp -o /tmp/session $(pkg-config --cflags --libs Qt5Core x11)
-      - name: Verify text delivery through X11
+      - name: Verify lazy X11 file transfers
         run: QT_BRIDGE_BINARY=/tmp/session xvfb-run -a python3 -m unittest discover -s tests -p test_clipboard_integration.py -v
   windows-protocol:
     runs-on: windows-latest

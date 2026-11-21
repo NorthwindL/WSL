@@ -482,7 +482,7 @@ class Bridge {
         if ((r.target != uri && r.target != gnome) || r.requestor == window) { notify(r, None); return; }
         if (!cached.isEmpty()) {
             if (exchange("CHECK " + offered).first() != "CURRENT") { notify(r, None); return; }
-            reply(r, r.target == gnome ? "copy\n" + cached : cached); return;
+            reply(r, r.target == gnome ? "copy\n" + QByteArray(cached).replace("\r\n", "\n") : cached); return;
         }
         pending.append(r);
         if (!loadingVersion.isEmpty()) return;
@@ -519,7 +519,7 @@ class Bridge {
             failPending(); return;
         }
         cached = urls;
-        for (const auto &r : pending) reply(r, r.target == gnome ? "copy\n" + cached : cached);
+        for (const auto &r : pending) reply(r, r.target == gnome ? "copy\n" + QByteArray(cached).replace("\r\n", "\n") : cached);
         pending.clear();
     }
     QByteArray getProperty(Atom &type, int &format, unsigned long &count) {
@@ -537,7 +537,9 @@ class Bridge {
         if (XGetSelectionOwner(d, clipboard) != sourceOwner || bytes.size() > maxUris) return;
         QByteArray request = "EXPORT " + exportVersion;
         int count = 0;
-        for (const auto &line : bytes.split('\n')) {
+        QByteArray uris = bytes;
+        if (uris.startsWith("copy\n") || uris.startsWith("cut\n")) uris = uris.mid(uris.indexOf('\n') + 1);
+        for (const auto &line : uris.split('\n')) {
             if (line.trimmed().isEmpty() || line.startsWith('#')) continue;
             QUrl url = QUrl::fromEncoded(line.trimmed(), QUrl::StrictMode);
             if (!url.isLocalFile() || ++count > 10000) return;
@@ -561,14 +563,15 @@ class Bridge {
         const auto bytes = getProperty(type, format, count);
         if (!requested) return;
         if (requested == targets) {
-            bool hasUris = false;
+            bool hasUris = false, hasGnome = false;
             if (type == XA_ATOM && format == 32) for (unsigned long i = 0; i < count; i++) {
                 unsigned long atom = 0; memcpy(&atom, bytes.constData() + i * sizeof(atom), sizeof(atom));
                 if (atom == uri) hasUris = true;
+                if (atom == gnome) hasGnome = true;
             }
-            if (!hasUris) { requested = 0; return; }
-            requested = uri;
-            XConvertSelection(d, clipboard, uri, property, window, CurrentTime); XFlush(d); return;
+            if (!hasUris && !hasGnome) { requested = 0; return; }
+            requested = hasUris ? uri : gnome;
+            XConvertSelection(d, clipboard, requested, property, window, CurrentTime); XFlush(d); return;
         }
         if (type == incr) { receiving = true; incoming.clear(); XFlush(d); return; }
         requested = 0;
