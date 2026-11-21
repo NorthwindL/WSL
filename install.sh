@@ -24,7 +24,7 @@ trap 'printf "\n安装在【%s】失败（第%s行）。修复报错后可重新
 usage() {
     cat <<'HELP'
 用法 bash install.sh [选项]
-默认启用双向文件桥接；Windows 文字直接桥接、截图使用 WSLg 原生通道，默认安装中文环境和 Fcitx5，不安装独立桌面。
+默认启用双向文件桥接；文字和截图保留 WSLg 原生通道，后台只桥接文件，默认安装中文环境和 Fcitx5，不安装独立桌面。
   --dry-run         显示安装计划，保持系统当前状态
   --check           检查依赖和后台服务状态
   --with-chinese    安装中文字体、语言和 Fcitx5 输入法（默认）
@@ -743,6 +743,10 @@ static QString mapPath(QString flag, QString path) {
 
 static QByteArray offer(const QMimeData *data, QByteArray seq, bool filesOnly) {
     if (!data) return {};
+    // Do not ask native clipboard owners to render text/image data while
+    // looking for files. This avoids unnecessary Windows/RDP data requests.
+    if (filesOnly && !data->hasFormat("text/uri-list") &&
+        !data->hasFormat("x-special/gnome-copied-files")) return {};
     QList<QUrl> urls = data->urls();
     if (urls.isEmpty() && data->hasFormat("x-special/gnome-copied-files")) {
         auto lines = data->data("x-special/gnome-copied-files").split('\n');
@@ -779,7 +783,7 @@ struct StagedFiles {
     ~StagedFiles() { if (!keep && !root.isEmpty()) QDir(root).removeRecursively(); }
 };
 
-static bool stageFiles(QMimeData &data, StagedFiles &staging, const QList<QByteArray> &paths) {
+static bool stageFiles(QMimeData &data, StagedFiles &staging, const QList<QByteArray> &paths, bool pathText) {
     QList<QUrl> urls;
     QStringList names, sources;
     for (const auto &encoded : paths) {
@@ -811,7 +815,10 @@ static bool stageFiles(QMimeData &data, StagedFiles &staging, const QList<QByteA
     }
     if (!names.isEmpty()) staging.root = QFileInfo(QFileInfo(names.first()).path()).path();
     data.setUrls(urls);
-    data.setText(names.join('\n'));
+    // Advertising file paths as plain text makes WSLg mirror them back into
+    // Windows, replacing the original clipboard formats. Only private sessions
+    // may expose that convenience text target.
+    if (pathText) data.setText(names.join('\n'));
     QByteArray gnomeFiles = "copy";
     for (const auto &url : urls) gnomeFiles += "\n" + url.toEncoded();
     data.setData("x-special/gnome-copied-files", gnomeFiles);
@@ -863,8 +870,12 @@ int main(int argc, char **argv) {
     auto clipboard = app.clipboard();
     QByteArray seq = "-1";
     bool dirty = false, importing = false, busy = false;
+    quint64 generation = 0;
     QObject::connect(clipboard, &QClipboard::dataChanged, [&] {
-        if ((!desktop || filesBridge) && !importing && !clipboard->ownsClipboard()) dirty = true;
+        if ((!desktop || filesBridge) && !importing && !clipboard->ownsClipboard()) {
+            ++generation;
+            dirty = true;
+        }
     });
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, [&] {
@@ -873,11 +884,17 @@ int main(int argc, char **argv) {
         bool retryExport = false;
         if ((!desktop || filesBridge) && dirty && seq != "-1") {
             dirty = false;
+            const auto offeredGeneration = generation;
             QByteArray request = offer(clipboard->mimeData(), seq, filesBridge);
+            app.processEvents(QEventLoop::ExcludeUserInputEvents);
+            if (generation != offeredGeneration) return;
             if (!request.isEmpty() && (!filesBridge || request.startsWith("FILES "))) {
                 auto reply = exchange(request);
                 if (reply.first() == "OK") { seq = reply.value(1); return; }
-                if (reply.first() == "ERROR") { dirty = true; return; }
+                if (reply.first() == "ERROR") {
+                    qWarning("File export failed; waiting for a new local copy instead of repeatedly writing Windows clipboard");
+                    return;
+                }
                 // WSLg may have mirrored this selection while we prepared the
                 // file offer. Refresh its version before retrying the export.
                 if (reply.first() == "CHANGED") { retryExport = true; dirty = true; }
@@ -894,7 +911,7 @@ int main(int argc, char **argv) {
         auto data = std::make_unique<QMimeData>();
         StagedFiles staging;
         if (type == "FILES") {
-            if (!stageFiles(*data, staging, frame.mid(2))) {
+            if (!stageFiles(*data, staging, frame.mid(2), !desktop)) {
                 qWarning("Could not stage the complete file selection");
                 data = std::make_unique<QMimeData>();
                 seq = version;
@@ -917,7 +934,7 @@ int main(int argc, char **argv) {
         dirty = false;
         seq = version;
     });
-    timer.start(250);
+    timer.start(filesOnly ? 500 : 250);
     return app.exec();
 }
 SESSION_CPP
@@ -933,6 +950,9 @@ using System;
 using System.Runtime.InteropServices;
 public static class ClipVersion {
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] public static extern bool IsClipboardFormatAvailable(uint format);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern uint RegisterClipboardFormat(string name);
     [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     public static uint OwnerProcessId() {
@@ -1012,6 +1032,8 @@ if (!$owned) {
     if ($nativeDesktop) { throw 'A clipboard provider for this WSL distribution and display is already running' }
     throw 'Another WSL file session is running'
 }
+$bridgeMarker = [ClipVersion]::RegisterClipboardFormat('Northwind.WSL.FileClipboard.v1')
+if (!$bridgeMarker) { throw 'Unable to register clipboard origin marker' }
 $utf8 = New-Object Text.UTF8Encoding($false, $true)
 function Encode([string]$value) { [Convert]::ToBase64String($utf8.GetBytes($value)) }
 function Decode([string]$value) { $utf8.GetString([Convert]::FromBase64String($value)) }
@@ -1021,6 +1043,11 @@ function Exchange([string]$request) {
     if ($parts[0] -eq "CHECK") { if ($parts[1] -eq [string]$sequence) { return "CURRENT" }; return "CHANGED" }
     if ($parts[0] -eq 'READ') {
         if ($parts[1] -eq [string]$sequence) { return "SAME $sequence" }
+        # Read format metadata before touching OLE clipboard data. Ordinary
+        # Windows text, rich text and images must never be opened or imported
+        # by the default file bridge.
+        if ($filesOnly -and ![ClipVersion]::IsClipboardFormatAvailable(15)) { return "EMPTY $sequence" }
+        if ([ClipVersion]::IsClipboardFormatAvailable($bridgeMarker)) { return "SAME $sequence" }
         # WSLg republishes Linux selections through its RDP client. Keep that
         # local selection instead of importing the same content again.
         if ($nativeDesktop -and (Test-WslgClipboardOwner)) { return "SAME $sequence" }
@@ -1049,6 +1076,7 @@ function Exchange([string]$request) {
         if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
         return $reply
     }
+    if ($filesOnly -and $parts[0] -ne 'FILES') { return 'ERROR' }
     if ($parts[1] -ne [string]$sequence) { return 'CHANGED' }
     $formats = [Collections.Generic.List[uint32]]::new()
     $payloads = [Collections.Generic.List[byte[]]]::new()
@@ -1062,6 +1090,8 @@ function Exchange([string]$request) {
             $header[16] = 1
             $payloads.Add([byte[]]($header + [Text.Encoding]::Unicode.GetBytes(($paths -join [char]0) + [char]0 + [char]0)))
             $formats.Add(15)
+            $formats.Add($bridgeMarker)
+            $payloads.Add([byte[]]@(1))
         }
         TEXT {
             $text = (Decode $parts[2]).Replace("`r`n", "`n").Replace("`n", "`r`n")
@@ -1191,6 +1221,28 @@ OPENCODE
     done
 }
 
+stop_clipboard_bridges() {
+    STEP=停止旧剪贴板桥接
+    local unit pid exe owner
+    for unit in wsl-clipboard-desktop.service xclip-linux-files-bridge.service xclip-bridge.service xclip-files-bridge.service; do
+        if [[ $(user_systemctl show -p LoadState --value "$unit" 2>/dev/null) != not-found ]]; then
+            user_systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        fi
+    done
+    # Match only this user's installed bridge binary, including replaced files.
+    # Do not terminate unrelated PowerShell processes or Windows applications.
+    for exe in /proc/[0-9]*/exe; do
+        owner=$(stat -c %u "${exe%/exe}" 2>/dev/null) || continue
+        [[ $owner == "$(id -u)" ]] || continue
+        case "$(readlink "$exe" 2>/dev/null || true)" in
+            "$HOME/.local/lib/wsl-clipboard-session/session"|"$HOME/.local/lib/wsl-clipboard-session/session (deleted)")
+                pid=${exe%/exe}; pid=${pid##*/}
+                kill -TERM "$pid" 2>/dev/null || true
+                ;;
+        esac
+    done
+}
+
 configure_services() {
     STEP=后台服务
     write_user_file "$HOME/.local/bin/xclip-bridge-start" 755 <<'START'
@@ -1219,7 +1271,7 @@ for socket in /run/WSL/1_interop /run/WSL/*_interop; do
         export WSL_INTEROP="$socket"
         exec "$HOME/.local/lib/wsl-clipboard-session/session" \
             /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe \
-            "$HOME/.local/lib/wsl-clipboard-session/backend.ps1" "${1:---text-files}"
+            "$HOME/.local/lib/wsl-clipboard-session/backend.ps1" "${1:---files-only}"
     fi
 done
 printf '未找到 WSL 互操作 socket\n' >&2
@@ -1230,7 +1282,7 @@ DESKTOP_START
 Description=Windows clipboard data for ordinary WSLg applications
 StartLimitIntervalSec=0
 [Service]
-ExecStart=%h/.local/bin/wsl-clipboard-desktop-start --$([[ $CLIPBOARD_MODE == desktop ]] && echo desktop || echo text-files)
+ExecStart=%h/.local/bin/wsl-clipboard-desktop-start --$([[ $CLIPBOARD_MODE == desktop ]] && echo desktop || echo files-only)
 Environment="DISPLAY=$DISPLAY"
 Environment="WSL_DISTRO_NAME=$WSL_DISTRO_NAME"
 Environment=QT_QPA_PLATFORM=xcb
@@ -1341,7 +1393,7 @@ main() {
     if [[ $DRY_RUN == true ]]; then
         printf '计划安装中文环境=%s，系统升级=%s\n' \
             "$([[ $INSTALL_CHINESE == true ]] && echo 是 || echo 否)" "$UPGRADE"
-        printf '剪贴板模式=%s（files=文字直连及双向文件；desktop=普通WSLg窗口；native=仅WSLg原生；files-out=Linux到Windows文件增强；session=独立窗口双向剪贴板）\n' "$CLIPBOARD_MODE"
+        printf '剪贴板模式=%s（files=保留原生文字及双向文件；desktop=普通WSLg窗口；native=仅WSLg原生；files-out=Linux到Windows文件增强；session=独立窗口双向剪贴板）\n' "$CLIPBOARD_MODE"
         printf '将保留原生 xclip，安装 wl-clipboard；增强桥接使用独立的 wsl-xclip 命令。\n'
         printf '已有配置备份至 ~/.local/state/wsl-ai-setup/backups。\n'
         printf '普通 WSLg 模式可直接运行 ai.opencode；独立窗口需显式选择 --opencode-session。\n'
@@ -1351,6 +1403,7 @@ main() {
     preflight
     install_packages
     configure_wsl
+    stop_clipboard_bridges
     if [[ $INSTALL_CHINESE == true ]]; then configure_chinese; fi
     install_file_staging
     install_clipboard
@@ -1366,7 +1419,7 @@ main() {
     if [[ $CLIPBOARD_MODE == session ]]; then
         printf '启动双向剪贴板窗口：~/.local/bin/wsl-clipboard-app 程序名 [参数...]\n'
     elif [[ $CLIPBOARD_MODE == desktop || $CLIPBOARD_MODE == files ]]; then
-        printf 'Windows 文字直连及文件剪贴板服务已启用，可直接打开普通 WSLg X11 应用。\n'
+        printf '双向文件剪贴板服务已启用，文字和图片不由后台重发布，可直接打开普通 WSLg X11 应用。\n'
     else
         printf '普通 WSLg 窗口使用原生剪贴板。双向文件粘贴可选 --file-session。\n'
     fi
