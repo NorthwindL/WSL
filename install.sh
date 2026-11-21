@@ -868,6 +868,30 @@ int main(int argc, char **argv) {
         return host.readLine().trimmed().split(' ');
     };
     auto clipboard = app.clipboard();
+    // Qt/Xcb expands text/uri-list into text/plain even when QMimeData has no
+    // text. Use native xclip with an exact target for ordinary-desktop file
+    // imports so WSLg cannot mirror a generated plain-text representation.
+    std::unique_ptr<QProcess> fileOwner;
+    auto publishFileUris = [&](const QByteArray &uris) {
+        auto next = std::make_unique<QProcess>();
+        next->setStandardErrorFile(QProcess::nullDevice());
+        next->start("/usr/bin/xclip", {"-selection", "clipboard", "-target", "text/uri-list", "-in", "-quiet"});
+        if (!next->waitForStarted()) return false;
+        if (next->write(uris) < 0) { next->kill(); next->waitForFinished(); return false; }
+        next->closeWriteChannel();
+        QElapsedTimer deadline;
+        deadline.start();
+        while (next->bytesToWrite() && deadline.elapsed() < 3000) next->waitForBytesWritten(20);
+        if (next->bytesToWrite() || next->state() == QProcess::NotRunning) {
+            next->kill(); next->waitForFinished(); return false;
+        }
+        if (fileOwner) { fileOwner->terminate(); fileOwner->waitForFinished(1000); }
+        fileOwner = std::move(next);
+        return true;
+    };
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, [&] {
+        if (fileOwner) { fileOwner->terminate(); fileOwner->waitForFinished(1000); }
+    });
     QByteArray seq = "-1";
     bool dirty = false, importing = false, busy = false;
     quint64 generation = 0;
@@ -927,9 +951,19 @@ int main(int argc, char **argv) {
         if (exchange("CHECK " + version).first() != "CURRENT") return;
         app.processEvents(QEventLoop::ExcludeUserInputEvents);
         if (dirty && seq != "-1") return;
-        staging.keep = true;
         importing = true;
-        clipboard->setMimeData(data.release());
+        if (type == "FILES" && desktop) {
+            if (!publishFileUris(data->data("text/uri-list"))) {
+                importing = false;
+                qWarning("Could not publish the exact file URI selection");
+                seq = version;
+                return;
+            }
+        } else {
+            if (fileOwner) { fileOwner->terminate(); fileOwner->waitForFinished(1000); fileOwner.reset(); }
+            clipboard->setMimeData(data.release());
+        }
+        staging.keep = true;
         importing = false;
         dirty = false;
         seq = version;
