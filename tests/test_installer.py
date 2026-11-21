@@ -95,6 +95,12 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(Path(name).name, self.source.name)
         self.assertEqual(Path(name).read_bytes(), self.source.read_bytes())
 
+    def test_idle_cleanup_does_not_create_cache(self):
+        helper = self.base / 'stage.py'
+        subprocess.run(['python3', str(helper), '--cleanup'],
+                       env={**os.environ, 'HOME': str(self.base)}, check=True)
+        self.assertFalse((self.base / '.cache/wsl-clipboard/files').exists())
+
 
 class InstallerTests(unittest.TestCase):
     def test_default_and_mode_plans(self):

@@ -130,6 +130,7 @@ check_installation() {
         user_systemctl is-active --quiet wsl-clipboard-desktop.service || failed=1
     fi
     user_systemctl is-active --quiet wsl-clipboard-cleanup.timer || failed=1
+    if [[ $INSTALL_CHINESE == true ]]; then user_systemctl is-active --quiet wsl-fcitx5.service || failed=1; fi
     return "$failed"
 }
 
@@ -341,6 +342,8 @@ def main():
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, interrupted)
     os.umask(0o077)
+    if sys.argv[1:] == ['--cleanup'] and not ROOT.exists():
+        return
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     if ROOT.is_symlink() or ROOT.stat().st_uid != os.getuid():
         raise ValueError('clipboard cache must be owned by the current user')
