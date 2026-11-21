@@ -759,7 +759,13 @@ static QByteArray offer(const QMimeData *data, QByteArray seq, bool filesOnly) {
         QByteArray result = "FILES " + seq;
         for (const auto &url : urls) {
             if (!url.isLocalFile() || !QFileInfo::exists(url.toLocalFile())) return {};
-            if (url.toLocalFile().startsWith(QDir::homePath() + "/.cache/wsl-clipboard/files/")) return {};
+            // Resolve aliases before checking origin: a symlink to an imported
+            // Windows copy must never become a new Linux-to-Windows offer.
+            const QString canonical = QFileInfo(url.toLocalFile()).canonicalFilePath();
+            const QString cache = QFileInfo(QDir::homePath() + "/.cache/wsl-clipboard/files").canonicalFilePath();
+            if (canonical.isEmpty() || (!cache.isEmpty() &&
+                (canonical == cache || canonical.startsWith(cache + "/"))) ||
+                canonical.startsWith("/tmp/chatgpt-clipboard.")) return {};
             QString path = mapPath("-w", url.toLocalFile());
             if (path.isEmpty()) return {};
             result += " " + path.toUtf8().toBase64();
@@ -927,7 +933,7 @@ int main(int argc, char **argv) {
         auto frame = exchange("READ " + seq);
         auto type = frame.first(), version = frame.value(1);
         if (type == "SAME") { seq = version; return; }
-        if (type == "ERROR" || type == "CHANGED") return;
+        if (type == "ERROR" || type == "CHANGED" || type == "DEFER") return;
         // A new external Windows selection wins over an outdated local offer.
         if (retryExport) dirty = false;
         if ((filesOnly && type != "FILES") ||
@@ -988,6 +994,12 @@ public static class ClipVersion {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern uint RegisterClipboardFormat(string name);
     [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    public static uint ForegroundProcessId() {
+        uint id;
+        GetWindowThreadProcessId(GetForegroundWindow(), out id);
+        return id;
+    }
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     public static uint OwnerProcessId() {
         uint id;
@@ -1031,31 +1043,39 @@ public static class ClipVersion {
 '@
 # A regular Remote Desktop client can also own incoming clipboard data.
 # Only the client explicitly launched with /wslg is a WSLg echo.
-$script:wslgOwnerKey = ''
-$script:wslgOwnerResult = $false
+$script:wslgProcessCache = @{}
 function Test-WslgCommandLine([string]$commandLine) {
     return $commandLine -match '(?i)(?:^|\s)/wslg(?:\s|$)'
 }
-function Test-WslgClipboardOwner {
+function Test-WslgProcess([uint32]$processId) {
     try {
-        $ownerId = [ClipVersion]::OwnerProcessId()
-        if (!$ownerId) { return $false }
-        $process = [Diagnostics.Process]::GetProcessById([int]$ownerId)
+        if (!$processId) { return $false }
+        $process = [Diagnostics.Process]::GetProcessById([int]$processId)
         try {
             if ($process.ProcessName -notin @('msrdc', 'mstsc')) { return $false }
-            $key = [string]$ownerId + ':' + [string]$process.StartTime.Ticks
+            $key = [string]$processId + ':' + [string]$process.StartTime.Ticks
         } finally { $process.Dispose() }
-        if ($key -eq $script:wslgOwnerKey) { return $script:wslgOwnerResult }
-        $details = Get-CimInstance Win32_Process -Filter "ProcessId = $ownerId" -ErrorAction Stop
+        if ($script:wslgProcessCache.ContainsKey($key)) { return $script:wslgProcessCache[$key] }
+        $details = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop
         if (!$details -or !$details.CommandLine) { return $false }
         $result = Test-WslgCommandLine $details.CommandLine
-        $script:wslgOwnerKey = $key
-        $script:wslgOwnerResult = $result
+        if ($script:wslgProcessCache.Count -ge 128) { $script:wslgProcessCache.Clear() }
+        $script:wslgProcessCache[$key] = $result
         return $result
     } catch {
-        # An unavailable process identity must not discard a remote clipboard.
+        # Unknown process identity does not authorize an import or prove an echo.
         return $false
     }
+}
+function Test-WslgClipboardOwner { return (Test-WslgProcess ([ClipVersion]::OwnerProcessId())) }
+function Test-WslgForeground { return (Test-WslgProcess ([ClipVersion]::ForegroundProcessId())) }
+function Read-WindowsClipboard { return [Windows.Forms.Clipboard]::GetDataObject() }
+function Test-ExportFilePath([string]$path) {
+    # Windows FileDrop needs drive-absolute or UNC paths, never a POSIX path.
+    if ($path -notmatch '^(?:[A-Za-z]:[\/]|\\[^\]+\[^\]+(?:\|$))') { return $false }
+    if ($path -match '(?i)(?:^|[\/])\.cache[\/]wsl-clipboard[\/]files(?:[\/]|$)' -or
+        $path -match '(?i)(?:^|[\/])tmp[\/]chatgpt-clipboard\.') { return $false }
+    return $true
 }
 $window = New-Object Windows.Forms.Control
 $mutexName = 'Local\NorthwindWSLClipboardSession'
@@ -1082,10 +1102,14 @@ function Exchange([string]$request) {
         # by the default file bridge.
         if ($filesOnly -and ![ClipVersion]::IsClipboardFormatAvailable(15)) { return "EMPTY $sequence" }
         if ([ClipVersion]::IsClipboardFormatAvailable($bridgeMarker)) { return "SAME $sequence" }
+        # Copying a file inside Windows Explorer (including an RDP session) is
+        # not a request to import it into WSL. Defer without reading/claiming
+        # the clipboard until the user actually focuses a WSLg application.
+        if ($filesOnly -and $nativeDesktop -and !(Test-WslgForeground)) { return "DEFER $sequence" }
         # WSLg republishes Linux selections through its RDP client. Keep that
         # local selection instead of importing the same content again.
         if ($nativeDesktop -and (Test-WslgClipboardOwner)) { return "SAME $sequence" }
-        $data = [Windows.Forms.Clipboard]::GetDataObject()
+        $data = Read-WindowsClipboard
         $reply = "EMPTY $sequence"
         if ($data -and $data.GetDataPresent('FileDrop')) {
             $paths = @(foreach ($path in $data.GetData('FileDrop')) { Encode $path })
@@ -1117,7 +1141,12 @@ function Exchange([string]$request) {
     switch ($parts[0]) {
         FILES {
             $paths = New-Object Collections.Specialized.StringCollection
-            for ($i=2; $i -lt $parts.Length; $i++) { [void]$paths.Add((Decode $parts[$i])) }
+            for ($i=2; $i -lt $parts.Length; $i++) {
+                $path = Decode $parts[$i]
+                if (!(Test-ExportFilePath $path)) { return 'ERROR' }
+                [void]$paths.Add($path)
+            }
+            if (!$paths.Count) { return 'ERROR' }
             # DROPFILES followed by double-NUL-terminated UTF-16 paths.
             $header = New-Object byte[] 20
             $header[0] = 20

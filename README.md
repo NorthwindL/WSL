@@ -17,7 +17,7 @@ bash /tmp/wsl-ai-install.sh
 | Windows → WSLg 中文文字、多行、emoji | 使用 WSLg 原生通道；默认桥接通过文件格式标志跳过文字，不调用 GetDataObject 读取文字 |
 | WSLg → Windows 文字 | 使用 WSLg 原生通道，保留原生 xclip 的选择区和参数行为 |
 | Windows 截图 | 使用 WSLg 原生图片通道；安装 wl-copy / wl-paste 便于操作 Wayland 剪贴板 |
-| Windows → WSLg 文件 | 仅在存在 CF_HDROP 时读取磁盘文件列表，完成受限复制后发布文件 URI；不提供纯文本路径目标 |
+| Windows → WSLg 文件 | Windows 桌面/资源管理器处于前台时不读取、不导入；切换到经确认的 WSLg 窗口后才读取 CF_HDROP 并发布文件 URI，不提供纯文本路径目标 |
 | WSLg → Windows 文件 | 后台服务读取 X11 文件 URI，通过 WSL 共享路径发布 Windows FileDrop；不复制文件内容到控制台 |
 | 文件副本 | 保存至 ~/.cache/wsl-clipboard/files/copy-*，目录权限 0700，文件补充当前用户读写权限 |
 | 容量与空间 | 单次总量最多 512 MiB、最多 10000 个文件及目录；预检并在复制中检查大小和剩余空间，保留至少 64 MiB |
@@ -83,6 +83,14 @@ bash /tmp/wsl-ai-install.sh --upgrade
 完成后退出并重新打开目标 WSLg 应用。先测试 Windows 记事本、浏览器、Word / Excel 之间的连续复制，确认文字、表格和格式正常，再测双向文件。如果 WSLg 已进入剪贴板占用异常状态，脚本更新不一定能解除已有占用：保存全部 WSL 工作后，在 Windows PowerShell 执行 `wsl --shutdown`，再打开 WSL。该命令会停止全部发行版，安装器不会替你执行。
 
 安装器无法保证修复 WSLg / msrdc 自身的所有问题。CI 验证了模拟 Windows 协议下的 X11 剪贴板行为和 Windows 后端的格式保护逻辑，仍需在目标 Windows 主机核对实际效果。
+
+## 远程桌面内复制 Windows 文件
+
+从另一台电脑通过 RDP 登录此 Windows 主机，在主机桌面复制 Excel 等文件并粘贴副本时，默认桥接只检查剪贴板元数据，不读取或修改原始文件列表，也不创建 Linux 暂存副本。切换到 WSLg 应用后，才允许将该文件导入 Linux。无法确认前台窗口属于 WSLg 时，会继续等待，不按普通远程桌面客户端推断它是 WSLg。
+
+导入的缓存文件及其符号链接均禁止反向发布；Windows 后端另行拒绝 POSIX 路径、当前缓存路径和旧暂存路径作为 Windows FileDrop。真正从 Linux 文件系统主动复制的文件仍可反向粘贴。
+
+验收时先在远程 Windows 桌面选中文件，按 Ctrl+C、Ctrl+V，确认副本出现在原桌面且剪贴板没有变成 `/home/.../copy-...`。再从 Windows 复制文件，切换 WSLg 文件管理器，等导入完成后粘贴，核对内容；最后测试 Linux → Windows 文件粘贴。CI 用模拟前台窗口和 Windows 元数据验证这些边界，不代替真实 RDP 会话验收。
 
 ## 验证与排查
 

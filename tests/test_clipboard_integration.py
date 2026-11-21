@@ -224,6 +224,46 @@ for line in sys.stdin:
         self.assertEqual(len(self.export_local_file()), 1)
 
 
+    def test_windows_file_copy_stays_deferred_until_linux_focus(self):
+        source = self.base / 'desktop.xlsx'
+        source.write_bytes(b'original desktop file')
+        self.update('DEFER', '')
+        self.start()
+        self.wait_for_requests('READ ')
+        time.sleep(0.8)
+        self.assertFalse((self.base / '.cache/wsl-clipboard/files').exists(),
+                         'Windows-only copying must not create Linux cache copies')
+        # Focus changes, but the Windows clipboard sequence does not.
+        pending = self.base / 'pending.json'
+        pending.write_text(json.dumps({'sequence': str(self.sequence), 'type': 'FILES',
+                                       'data': base64.b64encode(str(source).encode()).decode()}))
+        pending.replace(self.state)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            uris = self.read('text/uri-list')
+            if uris:
+                copied = Path(unquote(urlparse(uris.strip()).path))
+                if copied.exists() and copied.read_bytes() == source.read_bytes():
+                    return
+            time.sleep(0.1)
+        self.fail('Deferred copy was consumed before the Linux focus change')
+
+    def test_symlink_to_windows_cache_is_not_exported(self):
+        cache = self.base / '.cache/wsl-clipboard/files/copy-example/1'
+        cache.mkdir(parents=True)
+        source = cache / 'desktop.xlsx'
+        source.write_bytes(b'Windows origin')
+        alias = self.base / 'shortcut.xlsx'
+        alias.symlink_to(source)
+        self.start()
+        self.wait_for_requests('READ ')
+        time.sleep(0.6)
+        self.own_selection('text/uri-list', alias.as_uri() + '\r\n')
+        time.sleep(1.2)
+        self.assertFalse(any(line.startswith('FILES ') for line in self.log.read_text().splitlines()),
+                         'A symlink to a Windows import was exported back into Windows')
+
+
 
 if __name__ == '__main__':
     unittest.main()
