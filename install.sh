@@ -206,7 +206,7 @@ configure_wsl() {
     else
         : > "$TEMP_DIR/wsl.conf"
     fi
-    set_ini_value boot systemd false "$TEMP_DIR/wsl.conf" > "$TEMP_DIR/wsl.1"
+    set_ini_value boot systemd true "$TEMP_DIR/wsl.conf" > "$TEMP_DIR/wsl.1"
     set_ini_value interop enabled true "$TEMP_DIR/wsl.1" > "$TEMP_DIR/wsl.2"
     set_ini_value interop appendWindowsPath true "$TEMP_DIR/wsl.2" > "$TEMP_DIR/wsl.3"
     if ! sudo cmp -s /etc/wsl.conf "$TEMP_DIR/wsl.3"; then
