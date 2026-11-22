@@ -1,9 +1,11 @@
 """Real X11 selection requests with a simulated Windows metadata/data backend."""
 import base64
+import ctypes
 import json
 import os
 from pathlib import Path
 import subprocess
+import struct
 import tempfile
 import time
 import unittest
@@ -21,6 +23,7 @@ class ClipboardIntegrationTests(unittest.TestCase):
         self.state = self.base / 'state.json'
         self.log = self.base / 'requests.log'
         self.seq = 0
+        self.png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=')
         self.source = self.base / '黑龙江分院-明细.xlsx'
         self.source.write_bytes(b'original Windows desktop workbook')
         self.update('FILES', [str(self.source)])
@@ -48,8 +51,9 @@ for line in sys.stdin:
         reply = 'CURRENT' if parts[1] == seq else 'CHANGED'
     elif action == 'PULL':
         reply = ('FILES ' + seq + ' ' + ' '.join(base64.b64encode(p.encode()).decode() for p in state['paths'])
-                 if parts[1] == seq and state['kind'] == 'FILES' else 'CHANGED')
-    elif action == 'EXPORT':
+                 if parts[1] == seq and state['kind'] == 'FILES' else
+                 'IMAGE ' + seq + ' ' + state['image'] if parts[1] == seq and state['kind'] == 'IMAGE' else 'CHANGED')
+    elif action in ('EXPORT', 'EXIMAGE'):
         if parts[1] != seq: reply = 'CHANGED'
         else:
             seq = str(int(seq) + 1)
@@ -67,7 +71,7 @@ for line in sys.stdin:
     def update(self, kind, paths=None):
         self.seq += 1
         pending = self.base / 'state.new'
-        pending.write_text(json.dumps({'sequence': str(self.seq), 'kind': kind, 'paths': paths or []}))
+        pending.write_text(json.dumps({'sequence': str(self.seq), 'kind': kind, 'paths': paths or [], 'image': base64.b64encode(self.png).decode()}))
         pending.replace(self.state)
 
     def start(self):
@@ -150,13 +154,13 @@ for line in sys.stdin:
     def own(self, target, content):
         owner = subprocess.Popen(['xclip', '-selection', 'clipboard', '-target', target, '-in', '-quiet'],
                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        owner.stdin.write(content.encode()); owner.stdin.close()
+        owner.stdin.write(content if isinstance(content, bytes) else content.encode()); owner.stdin.close()
         def stop():
             if owner.poll() is None: owner.terminate()
             try: owner.wait(timeout=3)
             except subprocess.TimeoutExpired: owner.kill(); owner.wait()
         self.addCleanup(stop)
-        self.wait_for(lambda: self.read(target) == content)
+        self.wait_for(lambda: (self.read_bytes(target) if isinstance(content, bytes) else self.read(target)) == content)
 
     def test_linux_file_copy_exports_without_windows_import(self):
         self.update('OTHER')
@@ -202,6 +206,97 @@ for line in sys.stdin:
         stdout, _ = reader.communicate(timeout=8)
         self.assertEqual(stdout, b'')
         self.assertFalse(self.cache.exists())
+
+
+    def read_bytes(self, target):
+        result = subprocess.run(['xclip', '-selection', 'clipboard', '-target', target, '-o'],
+                                capture_output=True, timeout=8)
+        return result.stdout if result.returncode == 0 else None
+
+    def test_windows_image_is_retrieved_only_on_paste(self):
+        self.update('IMAGE'); self.start()
+        self.wait_for(lambda: 'image/png' in (self.read('TARGETS') or ''))
+        self.assertFalse(any(r.startswith('PULL ') for r in self.requests()))
+        self.assertEqual(self.read_bytes('image/png'), self.png)
+        self.assertEqual(self.read_bytes('image/png'), self.png)
+        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
+        self.assertFalse(self.cache.exists())
+
+    def test_linux_png_copy_is_published_to_windows(self):
+        self.update('OTHER'); self.start()
+        self.own('image/png', self.png)
+        self.wait_for(lambda: any(r.startswith('EXIMAGE ') for r in self.requests()))
+        request = next(r for r in self.requests() if r.startswith('EXIMAGE '))
+        self.assertEqual(base64.b64decode(request.split(' ')[2]), self.png)
+        self.assertFalse(any(r.startswith('PULL ') for r in self.requests()))
+
+    def test_image_after_file_replaces_only_file_offer(self):
+        self.start(); self.wait_targets()
+        self.update('IMAGE')
+        self.wait_for(lambda: 'image/png' in (self.read('TARGETS') or ''))
+        self.assertNotIn('text/uri-list', self.read('TARGETS'))
+        self.assertEqual(self.read_bytes('image/png'), self.png)
+        self.assertFalse(self.cache.exists())
+
+    def test_file_to_native_text_handoff_does_not_clear_selection(self):
+        self.start(); self.wait_targets()
+        x11 = ctypes.CDLL('libX11.so.6')
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x11.XInternAtom.restype = ctypes.c_ulong
+        x11.XGetSelectionOwner.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x11.XGetSelectionOwner.restype = ctypes.c_ulong
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        display = x11.XOpenDisplay(None)
+        self.assertTrue(display)
+        self.addCleanup(lambda: x11.XCloseDisplay(display))
+        clipboard = x11.XInternAtom(display, b'CLIPBOARD', 0)
+        old_owner = x11.XGetSelectionOwner(display, clipboard)
+        self.assertNotEqual(old_owner, 0)
+        self.update('OTHER'); time.sleep(0.6)
+        self.assertEqual(x11.XGetSelectionOwner(display, clipboard), old_owner,
+                         'Do not inject an empty-owner event before native WSLg text arrives')
+        for text in ('中文第一行\n第二行 😀', '原生文本' * 3000):
+            self.own('UTF8_STRING', text)
+            self.assertEqual(self.read('UTF8_STRING'), text)
+        self.assertFalse(any(r.startswith(('PULL ', 'EXPORT ', 'EXIMAGE ')) for r in self.requests()))
+
+    def test_image_to_native_html_handoff(self):
+        self.update('IMAGE'); self.start()
+        self.wait_for(lambda: 'image/png' in (self.read('TARGETS') or ''))
+        self.assertEqual(self.read_bytes('image/png'), self.png)
+        self.update('OTHER'); time.sleep(0.5)
+        html = '<b>原生 HTML 文本</b>'
+        self.own('text/html', html)
+        self.assertEqual(self.read('text/html'), html)
+        self.assertFalse(any(r.startswith(('EXPORT ', 'EXIMAGE ')) for r in self.requests()))
+
+
+    def test_linux_bmp_only_copy_is_published_as_image(self):
+        bmp = b'BM' + struct.pack('<IHHI', 58, 0, 0, 54) + struct.pack('<IiiHHIIiiII', 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0) + bytes((0, 0, 255, 0))
+        self.update('OTHER'); self.start()
+        self.own('image/bmp', bmp)
+        self.wait_for(lambda: any(r.startswith('EXIMAGE ') for r in self.requests()))
+        request = next(r for r in self.requests() if r.startswith('EXIMAGE '))
+        self.assertEqual(base64.b64decode(request.split(' ')[2]), bmp)
+
+
+    @unittest.skipUnless(os.environ.get('MIXED_CLIPBOARD_BINARY'), 'requires a mixed-format application fixture')
+    def test_mixed_text_and_image_copy_stays_native(self):
+        self.update('OTHER'); self.start()
+        owner = subprocess.Popen([os.environ['MIXED_CLIPBOARD_BINARY']], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 env={**os.environ, 'QT_QPA_PLATFORM': 'xcb'})
+        def stop():
+            owner.terminate()
+            try: owner.wait(timeout=3)
+            except subprocess.TimeoutExpired: owner.kill(); owner.wait()
+        self.addCleanup(stop)
+        text = '原生 mixed 文本 😀'
+        self.wait_for(lambda: self.read('UTF8_STRING') == text)
+        time.sleep(0.8)
+        self.assertIn('image/png', self.read('TARGETS'))
+        self.assertIn(text, self.read('text/html'))
+        self.assertFalse(any(r.startswith(('PULL ', 'EXPORT ', 'EXIMAGE ')) for r in self.requests()))
 
 
 

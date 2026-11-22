@@ -416,11 +416,11 @@ static QString mapPath(const QString &flag, const QString &path) {
 class Bridge {
     Display *d = nullptr;
     Window window = 0, observed = 0, sourceOwner = 0;
-    Atom clipboard, targets, uri, gnome, incr, property;
+    Atom clipboard, targets, uri, gnome, png, bmp, utf8, plain, plainUtf8, html, textAtom, incr, property;
     QProcess host, stage;
     QTimer timer;
     std::unique_ptr<QSocketNotifier> notifier;
-    QByteArray version = "-1", offered, loadingVersion, cached;
+    QByteArray version = "-1", offered, offeredKind, loadingVersion, cached;
     QList<XSelectionRequestEvent> pending;
     bool receiving = false;
     Atom requested = 0;
@@ -430,6 +430,11 @@ class Bridge {
     QList<Transfer> transfers;
     static constexpr int chunk = 32768;
     static constexpr int maxUris = 4 * 1024 * 1024;
+    static constexpr int maxImage = 64 * 1024 * 1024;
+    Atom incomingTarget = 0;
+    bool validPng(const QByteArray &bytes) {
+        return bytes.size() <= maxImage && bytes.startsWith(QByteArray::fromHex("89504e470d0a1a0a"));
+    }
 
     QList<QByteArray> exchange(const QByteArray &request) {
         if (host.state() != QProcess::Running || host.write(request + '\n') < 0) return {"ERROR"};
@@ -477,12 +482,15 @@ class Bridge {
         }
         const Atom prop = r.property == None ? r.target : r.property;
         if (r.target == targets) {
-            const Atom formats[] = {targets, uri, gnome};
+            const Atom fileFormats[] = {targets, uri, gnome};
+            const Atom imageFormats[] = {targets, png};
+            const bool image = offeredKind == "IMAGE";
             XChangeProperty(d, r.requestor, prop, XA_ATOM, 32, PropModeReplace,
-                            reinterpret_cast<const unsigned char *>(formats), 3);
+                            reinterpret_cast<const unsigned char *>(image ? imageFormats : fileFormats), image ? 2 : 3);
             notify(r, prop); return; // Format probes never fetch Windows paths or stage files.
         }
-        if ((r.target != uri && r.target != gnome) || r.requestor == window) { notify(r, None); return; }
+        const bool supported = offeredKind == "IMAGE" ? r.target == png : (r.target == uri || r.target == gnome);
+        if (!supported || r.requestor == window) { notify(r, None); return; }
         if (!cached.isEmpty()) {
             if (exchange("CHECK " + offered).first() != "CURRENT") { notify(r, None); return; }
             reply(r, r.target == gnome ? "copy\n" + QByteArray(cached).replace("\r\n", "\n") : cached); return;
@@ -490,7 +498,14 @@ class Bridge {
         pending.append(r);
         if (!loadingVersion.isEmpty()) return;
         const auto frame = exchange("PULL " + offered);
-        if (frame.first() != "FILES" || frame.value(1) != offered || frame.size() < 3) { failPending(); return; }
+        if (frame.first() != offeredKind || frame.value(1) != offered || frame.size() < 3) { failPending(); return; }
+        if (offeredKind == "IMAGE") {
+            const auto image = QByteArray::fromBase64(frame.value(2));
+            if (!validPng(image) || exchange("CHECK " + offered).first() != "CURRENT") { failPending(); return; }
+            cached = image;
+            for (const auto &request : pending) reply(request, cached);
+            pending.clear(); return;
+        }
         QStringList sources;
         for (const auto &path : frame.mid(2)) {
             QString source = mapPath("-u", QString::fromUtf8(QByteArray::fromBase64(path)));
@@ -527,7 +542,8 @@ class Bridge {
     }
     QByteArray getProperty(Atom &type, int &format, unsigned long &count) {
         unsigned char *raw = nullptr; unsigned long after = 0;
-        if (XGetWindowProperty(d, window, property, 0, maxUris / 4, True, AnyPropertyType,
+        const int limit = (requested == png || requested == bmp) ? maxImage : maxUris;
+        if (XGetWindowProperty(d, window, property, 0, limit / 4, True, AnyPropertyType,
                                &type, &format, &count, &after, &raw) != Success) return {};
         // Xlib returns format-32 values as native unsigned longs.
         QByteArray bytes;
@@ -559,6 +575,13 @@ class Bridge {
         if (response.first() == "OK") version = response.value(1);
         // Never retry an old local offer after a newer Windows copy.
     }
+    void exportData(const QByteArray &bytes, Atom type) {
+        if (type != png && type != bmp) { exportFiles(bytes); return; }
+        const bool image = type == png ? validPng(bytes) : (bytes.size() >= 14 && bytes.size() <= maxImage && bytes.startsWith("BM"));
+        if (!image || XGetSelectionOwner(d, clipboard) != sourceOwner) return;
+        const auto response = exchange("EXIMAGE " + exportVersion + " " + bytes.toBase64());
+        if (response.first() == "OK") version = response.value(1);
+    }
     void sourceData(const XSelectionEvent &e) {
         if (!requested || e.target != requested) return;
         if (e.property == None || XGetSelectionOwner(d, clipboard) != sourceOwner) { requested = 0; return; }
@@ -566,19 +589,23 @@ class Bridge {
         const auto bytes = getProperty(type, format, count);
         if (!requested) return;
         if (requested == targets) {
-            bool hasUris = false, hasGnome = false;
+            bool hasUris = false, hasGnome = false, hasPng = false, hasBmp = false, hasText = false;
             if (type == XA_ATOM && format == 32) for (unsigned long i = 0; i < count; i++) {
                 unsigned long atom = 0; memcpy(&atom, bytes.constData() + i * sizeof(atom), sizeof(atom));
                 if (atom == uri) hasUris = true;
                 if (atom == gnome) hasGnome = true;
+                if (atom == png) hasPng = true;
+                if (atom == bmp) hasBmp = true;
+                if (atom == utf8 || atom == plain || atom == plainUtf8 || atom == html || atom == textAtom || atom == XA_STRING) hasText = true;
             }
-            if (!hasUris && !hasGnome) { requested = 0; return; }
-            requested = hasUris ? uri : gnome;
+            if ((!hasUris && !hasGnome && hasText) || (!hasUris && !hasGnome && !hasPng && !hasBmp)) { requested = 0; return; }
+            requested = hasUris ? uri : (hasGnome ? gnome : (hasPng ? png : bmp));
             XConvertSelection(d, clipboard, requested, property, window, CurrentTime); XFlush(d); return;
         }
-        if (type == incr) { receiving = true; incoming.clear(); XFlush(d); return; }
+        if (type == incr) { receiving = true; incomingTarget = requested; incoming.clear(); XFlush(d); return; }
+        const Atom target = requested;
         requested = 0;
-        if (format == 8) exportFiles(bytes);
+        if (format == 8) exportData(bytes, target);
     }
     void events() {
         while (XPending(d)) {
@@ -591,8 +618,8 @@ class Bridge {
                 if (e.xproperty.window == window && e.xproperty.atom == property && receiving && e.xproperty.state == PropertyNewValue) {
                     Atom type = 0; int format = 0; unsigned long count = 0;
                     const auto bytes = getProperty(type, format, count);
-                    if (!requested || format != 8 || incoming.size() + bytes.size() > maxUris) { receiving = false; requested = 0; }
-                    else if (bytes.isEmpty()) { receiving = false; requested = 0; exportFiles(incoming); incoming.clear(); }
+                    if (!requested || format != 8 || incoming.size() + bytes.size() > ((incomingTarget == png || incomingTarget == bmp) ? maxImage : maxUris)) { receiving = false; requested = 0; }
+                    else if (bytes.isEmpty()) { receiving = false; requested = 0; exportData(incoming, incomingTarget); incoming.clear(); }
                     else incoming += bytes;
                     XFlush(d);
                 }
@@ -614,16 +641,18 @@ class Bridge {
             version = state.value(1);
             if (sourceOwner && sourceOwner == XGetSelectionOwner(d, clipboard)) exportVersion = version;
         }
-        if (state.first() == "FILES" || state.first() == "OTHER") {
+        if (state.first() == "FILES" || state.first() == "IMAGE" || state.first() == "OTHER") {
             version = state.value(1);
             offered.clear(); cancelLoad(); requested = 0; receiving = false;
-            if (state.first() == "FILES") {
-                offered = version;
+            offeredKind.clear();
+            if (state.first() == "FILES" || state.first() == "IMAGE") {
+                offered = version; offeredKind = state.first();
                 XSetSelectionOwner(d, clipboard, window, CurrentTime); XFlush(d);
                 observed = window;
-            } else if (XGetSelectionOwner(d, clipboard) == window) {
-                XSetSelectionOwner(d, clipboard, None, CurrentTime); XFlush(d);
             }
+            // For text/HTML, invalidate only our old data. Do not clear X11
+            // ownership: an empty selection can be mirrored back into Windows
+            // before WSLg's native text owner finishes taking over.
         }
         const Window owner = XGetSelectionOwner(d, clipboard);
         if (owner != observed) {
@@ -648,6 +677,10 @@ public:
         XSelectInput(d, window, PropertyChangeMask);
         clipboard = XInternAtom(d, "CLIPBOARD", False); targets = XInternAtom(d, "TARGETS", False);
         uri = XInternAtom(d, "text/uri-list", False); gnome = XInternAtom(d, "x-special/gnome-copied-files", False);
+        png = XInternAtom(d, "image/png", False); bmp = XInternAtom(d, "image/bmp", False);
+        utf8 = XInternAtom(d, "UTF8_STRING", False); plain = XInternAtom(d, "text/plain", False);
+        plainUtf8 = XInternAtom(d, "text/plain;charset=utf-8", False); html = XInternAtom(d, "text/html", False);
+        textAtom = XInternAtom(d, "TEXT", False);
         incr = XInternAtom(d, "INCR", False); property = XInternAtom(d, "_WSL_FILE_SOURCE", False);
         QFile file(scriptPath); if (!file.open(QIODevice::ReadOnly)) return false;
         QString source = QString::fromUtf8(file.readAll());
@@ -685,6 +718,7 @@ SESSION_CPP
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -785,10 +819,61 @@ try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $
 if (!$owned) { throw 'A file clipboard bridge is already running for this distribution/display' }
 $bridgeMarker = [ClipVersion]::RegisterClipboardFormat('Northwind.WSL.FileClipboard.v1')
 if (!$bridgeMarker) { throw 'Unable to register clipboard origin marker' }
+$pngFormat = [ClipVersion]::RegisterClipboardFormat('PNG')
+if (!$pngFormat) { throw 'Unable to register PNG clipboard format' }
 $utf8 = New-Object Text.UTF8Encoding($false, $true)
 function Encode([string]$value) { [Convert]::ToBase64String($utf8.GetBytes($value)) }
 function Decode([string]$value) { $utf8.GetString([Convert]::FromBase64String($value)) }
 function Read-WindowsClipboard { return [Windows.Forms.Clipboard]::GetDataObject() }
+function Test-WindowsImageFormat {
+    return ([ClipVersion]::IsClipboardFormatAvailable($pngFormat) -or
+        [ClipVersion]::IsClipboardFormatAvailable(2) -or [ClipVersion]::IsClipboardFormatAvailable(8) -or
+        [ClipVersion]::IsClipboardFormatAvailable(17))
+}
+function Read-WindowsPng($data) {
+    $stream = $null
+    $bitmap = $null
+    try {
+        if ($data.GetDataPresent('PNG', $false)) {
+            $value = $data.GetData('PNG', $false)
+            if ($value -is [IO.MemoryStream]) { return ,$value.ToArray() }
+            if ($value -is [byte[]]) { return ,$value }
+        }
+        if (!$data.GetDataPresent('Bitmap')) { return $null }
+        $bitmap = $data.GetData('Bitmap')
+        $stream = New-Object IO.MemoryStream
+        $bitmap.Save($stream, [Drawing.Imaging.ImageFormat]::Png)
+        return ,$stream.ToArray()
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        if ($bitmap) { $bitmap.Dispose() }
+    }
+}
+function Publish-WindowsImage([string]$payload, [uint32]$sequence) {
+    $png = $null; $pngOutput = $null; $bitmap = $null; $bmp = $null
+    try {
+        $bytes = [Convert]::FromBase64String($payload)
+        if (!$bytes.Length -or $bytes.Length -gt 67108864) { return 'ERROR' }
+        $png = New-Object IO.MemoryStream(,$bytes)
+        $bitmap = [Drawing.Image]::FromStream($png)
+        $pngOutput = New-Object IO.MemoryStream
+        $bitmap.Save($pngOutput, [Drawing.Imaging.ImageFormat]::Png)
+        $normalized = $pngOutput.ToArray()
+        if ($normalized.Length -gt 67108864) { return 'ERROR' }
+        $bmp = New-Object IO.MemoryStream
+        $bitmap.Save($bmp, [Drawing.Imaging.ImageFormat]::Bmp)
+        if ($bmp.Length -lt 14) { return 'ERROR' }
+        $dib = New-Object byte[] ($bmp.Length - 14)
+        $bmp.Position = 14
+        $null = $bmp.Read($dib, 0, $dib.Length)
+        $payloads = [Collections.Generic.List[byte[]]]::new()
+        $payloads.Add($normalized); $payloads.Add($dib); $payloads.Add([byte[]]@(1))
+        return [ClipVersion]::Publish($window.Handle, $sequence, [uint32[]]@($pngFormat, 8, $bridgeMarker), $payloads.ToArray())
+    } catch { return 'ERROR' }
+    finally {
+        if ($pngOutput) { $pngOutput.Dispose() }; if ($bitmap) { $bitmap.Dispose() }; if ($bmp) { $bmp.Dispose() }; if ($png) { $png.Dispose() }
+    }
+}
 function Exchange([string]$request) {
     $parts = $request.Split(' ')
     $sequence = [ClipVersion]::GetClipboardSequenceNumber()
@@ -799,22 +884,33 @@ function Exchange([string]$request) {
     if ($parts[0] -eq 'POLL') {
         if ($parts[1] -eq [string]$sequence) { return "SAME $sequence" }
         if ([ClipVersion]::IsClipboardFormatAvailable($bridgeMarker)) { return "OTHER $sequence" }
-        if ([ClipVersion]::IsClipboardFormatAvailable(15)) { return "FILES $sequence" }
         if (Test-WslgClipboardOwner) { return "ECHO $sequence" }
+        if ([ClipVersion]::IsClipboardFormatAvailable(15)) { return "FILES $sequence" }
+        # Mixed rich-text/image selections are text and stay on the native path.
+        if ([ClipVersion]::IsClipboardFormatAvailable(13)) { return "OTHER $sequence" }
+        if (Test-WindowsImageFormat) { return "IMAGE $sequence" }
         return "OTHER $sequence"
     }
     if ($parts[0] -eq 'PULL') {
         if ($parts[1] -ne [string]$sequence) { return 'CHANGED' }
-        if (![ClipVersion]::IsClipboardFormatAvailable(15) -or
-            [ClipVersion]::IsClipboardFormatAvailable($bridgeMarker)) { return 'ERROR' }
-        # Only an X11 file-data request reaches this branch. Metadata polling,
-        # focus changes and Windows/RDP copy operations never retrieve file paths.
-        $data = Read-WindowsClipboard
-        if (!$data -or !$data.GetDataPresent('FileDrop')) { return 'ERROR' }
-        $paths = @(foreach ($path in $data.GetData('FileDrop')) { Encode $path })
-        if (!$paths.Count -or $paths.Count -gt 10000) { return 'ERROR' }
+        if ([ClipVersion]::IsClipboardFormatAvailable($bridgeMarker)) { return 'ERROR' }
+        if ([ClipVersion]::IsClipboardFormatAvailable(15)) {
+            $data = Read-WindowsClipboard
+            if (!$data -or !$data.GetDataPresent('FileDrop')) { return 'ERROR' }
+            $paths = @(foreach ($path in $data.GetData('FileDrop')) { Encode $path })
+            if (!$paths.Count -or $paths.Count -gt 10000) { return 'ERROR' }
+            if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
+            return "FILES $sequence " + ($paths -join ' ')
+        }
+        if ([ClipVersion]::IsClipboardFormatAvailable(13) -or !(Test-WindowsImageFormat)) { return 'ERROR' }
+        $bytes = Read-WindowsPng (Read-WindowsClipboard)
+        if (!$bytes -or $bytes.Length -gt 67108864) { return 'ERROR' }
         if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
-        return "FILES $sequence " + ($paths -join ' ')
+        return "IMAGE $sequence " + [Convert]::ToBase64String($bytes)
+    }
+    if ($parts[0] -eq 'EXIMAGE') {
+        if ($parts[1] -ne [string]$sequence) { return 'CHANGED' }
+        return Publish-WindowsImage $parts[2] $sequence
     }
     if ($parts[0] -ne 'EXPORT') { return 'ERROR' }
     if ($parts[1] -ne [string]$sequence) { return 'CHANGED' }

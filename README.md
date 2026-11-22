@@ -1,4 +1,4 @@
-# WSLg 按粘贴请求传输文件
+# WSLg 按粘贴请求传输文件与图片
 
 在 Debian / Ubuntu WSLg 普通用户终端执行：
 
@@ -7,7 +7,7 @@ curl -fL --retry 3 https://raw.githubusercontent.com/NorthwindL/WSL/main/install
 bash /tmp/wsl-ai-install.sh
 ```
 
-默认安装中文字体、zh_CN.UTF-8、Fcitx5 中文输入法、fcitx5-configtool 和双向文件桥接。文字、截图保持 WSLg 原生通道，不安装独立桌面、不强制应用切换显示后端。
+默认安装中文字体、zh_CN.UTF-8、Fcitx5 中文输入法、fcitx5-configtool 和双向文件/图片桥接。文字保持 WSLg 原生通道，文件与截图按数据请求处理，不安装独立桌面、不强制应用切换显示后端。
 
 ## 文件传输何时执行
 
@@ -18,20 +18,29 @@ bash /tmp/wsl-ai-install.sh
 | 切换或激活 Linux 窗口 | 不触发文件传输，已删除前台窗口判断逻辑 |
 | Linux 应用检查可用剪贴板格式 | 只返回文件格式信息，不读取 Windows 文件列表、不生成缓存 |
 | Linux 应用请求文件 URI 数据 | 此时才读取 Windows 文件列表并复制到 Linux 缓存，完成后返回可用的文件 URI |
+| Linux 应用请求 image/png 数据 | 此时才读取 Windows 图片，必要时将 Bitmap 转 PNG，向目标应用返回图片数据 |
 | 重复粘贴同一次 Windows 复制 | 复用已生成的缓存副本，不重复复制 |
 | 在 Linux 主动复制本地文件 | 向 Windows 发布标准 FileDrop 文件列表；缓存文件及其符号链接不反向发布 |
+| 在 Linux 复制 PNG/BMP 图片 | 将图片同步为 Windows PNG 与 DIB 格式，保持为图片 |
+| 在 Linux 复制文字、HTML 或混合文字/图片内容 | 文字优先使用原生通道，不主动重发布文字或覆盖其富文本格式 |
 
-桥接持续运行一个轻量的元数据监听进程，以便 Linux 应用知道剪贴板是否有文件；文件路径读取和内容传输均在请求文件数据时才执行。采用原生 X11 选择区协议，精确提供 `text/uri-list` 和 `x-special/gnome-copied-files`，不提供文件路径的纯文本回退，也不借助 Qt 自动转换格式。
+桥接持续运行一个轻量的元数据监听进程，以便 Linux 应用知道剪贴板是否有文件；文件路径读取、图片解码和内容传输均在应用请求相应数据时才执行。采用原生 X11 选择区协议，根据数据类型精确提供 `text/uri-list`、`x-special/gnome-copied-files` 或 `image/png`，不提供文件路径的纯文本回退，也不借助 Qt 自动转换格式。
 
 Ctrl+V、右键“粘贴”等操作只要目标应用请求上述文件数据，即可触发。**协议只能识别应用的数据请求，不能识别请求背后是否一定发生了用户点击**：若某个应用或剪贴板管理器主动预取文件数据，也会触发传输。单纯查询 TARGETS 不会触发。目标应用必须支持文件粘贴，不能把任意文本框都当成文件接收器。
 
-文件桥接覆盖 WSLg **X11 应用**。原生 Wayland 应用的文件数据请求不在本桥接范围内。Windows 虚拟附件（IStream）未实现，目前支持磁盘文件和目录。Windows PowerShell 必须位于当前用户可访问的 Windows 会话中；真实 RDP 会话兼容性仍需在目标主机验收。
+文件桥接覆盖 WSLg **X11 应用**。原生 Wayland 应用的文件/图片数据请求不在本桥接范围内。Windows 虚拟附件（IStream）未实现，目前支持磁盘文件和目录。Windows PowerShell 必须位于当前用户可访问的 Windows 会话中；真实 RDP 会话兼容性仍需在目标主机验收。
+
+## 文字交接与图片处理
+
+Windows 复制文字后，文件/图片桥接只使旧数据失效，不主动将 X11 剪贴板所有者设为空，交由 WSLg 原生文字所有者接管。Linux 复制文字时，同样不读取或重发布正文；含 UnicodeText 的 Windows 混合格式和含文字/HTML 的 Linux 混合格式优先走原生通道，避免表格、HTML 被图片或纯文字覆盖。
+
+图片按需读取为 PNG，Windows Bitmap 截图在请求时转换成 PNG。Linux 复制 PNG 或 BMP 时，Windows 同时收到 PNG、DIB 和来源标记，不把图片变成路径或文字。图片负载上限 64 MiB，图片数据不写入文件缓存。文件、图片、文字之间切换前核对剪贴板版本，避免向正在请求的应用返回已经失效的数据。
 
 ## 文件缓存与保护
 
 缓存位于 `~/.cache/wsl-clipboard/files/copy-*`，目录权限 0700，文件补充当前用户读写权限。单次最多 512 MiB、10000 个文件及目录；复制前和复制中检查剩余空间，保留至少 64 MiB。拒绝符号链接及特殊文件，失败清理本次副本。每小时清理创建超过 24 小时的缓存；下次传输前也清理。长期使用的文件请另存。
 
-Windows 后端只在 `PULL` 请求中读取文件列表；`POLL` 不触碰文件内容或文件列表。传输期间 Windows 剪贴板发生变化时，不向目标应用返回旧内容。反向复制仅接受 Windows 绝对路径或 WSL UNC 共享路径，禁止 POSIX 路径、缓存路径及旧暂存路径；写入前核对 Windows 剪贴板版本，避免覆盖较新的复制内容。
+Windows 后端只在 `PULL` 请求中读取文件列表或图片；`POLL` 只报告数据类型，不读取正文、文件列表或图片。文字由原生通道处理。传输期间 Windows 剪贴板发生变化时，不向目标应用返回旧内容。反向文件复制仅接受 Windows 绝对路径或 WSL UNC 共享路径，禁止 POSIX 路径、缓存路径及旧暂存路径；写入前核对 Windows 剪贴板版本，避免覆盖较新的复制内容。
 
 ## 常用选项
 
@@ -56,6 +65,8 @@ bash /tmp/wsl-ai-install.sh --upgrade
 
 ## 验证与排查
 
+文字测试应特别覆盖：先复制文件，再复制中文、多行、emoji 和长文字；先复制截图，再复制文字/HTML；确认文件与图片格式声明不会阻止原生文字接管。还需验证 Windows 截图 → Linux 图片附件，以及 Linux PNG/BMP → Windows 图片粘贴。
+
 1. 在 Windows 桌面复制 Excel 文件并粘贴副本，确认 Windows 原始操作正常。
 2. Windows 复制文件后，检查缓存没有新增；切换 Linux 窗口后仍不应新增。
 3. 在支持文件 URI 的 Linux 应用粘贴，确认此时才生成副本且内容正确。
@@ -76,4 +87,4 @@ bash -n install.sh
 python3 -m unittest discover -s tests -v
 ```
 
-CI 编译 QtCore/X11 程序，用真实 X11 数据请求和模拟 Windows 后端验证无预取、首次粘贴触发、重复粘贴复用、GNOME 文件格式、大选区 INCR、反向复制和原生 HTML 保留。在 Windows 验证元数据轮询不读取文件路径，以及只有粘贴请求可取路径。CI 不替代真实 Windows/RDP 的端到端验收。
+CI 编译 QtCore/X11 程序，用真实 X11 数据请求和模拟 Windows 后端验证无预取、首次粘贴触发、重复粘贴复用、GNOME 文件格式、大选区 INCR、双向图片、反向文件复制、文件/图片到文字的所有权交接和混合格式原生保留。在 Windows 验证元数据轮询不读取文件/图片、只有粘贴请求可取数据、Bitmap→PNG 转换，以及 PNG/BMP 反向同步为正确的 PNG/DIB 格式。CI 不替代真实 Windows/RDP 的端到端验收。
