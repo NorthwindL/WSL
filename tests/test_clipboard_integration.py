@@ -39,6 +39,9 @@ class ClipboardIntegrationTests(unittest.TestCase):
         self.host.write_text('''#!/usr/bin/env python3
 import base64, json, os, sys
 from pathlib import Path
+source = base64.b64decode(sys.stdin.readline().strip(), validate=True).decode()
+if not source.startswith(("$desktopIdentity", "$textFallback")):
+    sys.exit(1)
 for line in sys.stdin:
     with open(os.environ['TEST_REQUESTS'], 'a') as log: log.write(line)
     parts = line.strip().split(' ')
@@ -52,7 +55,8 @@ for line in sys.stdin:
     elif action == 'PULL':
         reply = ('FILES ' + seq + ' ' + ' '.join(base64.b64encode(p.encode()).decode() for p in state['paths'])
                  if parts[1] == seq and state['kind'] == 'FILES' else
-                 'IMAGE ' + seq + ' ' + state['image'] if parts[1] == seq and state['kind'] == 'IMAGE' else 'CHANGED')
+                 'IMAGE ' + seq + ' ' + state['image'] if parts[1] == seq and state['kind'] == 'IMAGE' else
+                 'TEXT ' + seq + ' ' + state['paths'][0] if parts[1] == seq and state['kind'] == 'TEXT' else 'CHANGED')
     elif action in ('EXPORT', 'EXIMAGE'):
         if parts[1] != seq: reply = 'CHANGED'
         else:
@@ -74,10 +78,11 @@ for line in sys.stdin:
         pending.write_text(json.dumps({'sequence': str(self.seq), 'kind': kind, 'paths': paths or [], 'image': base64.b64encode(self.png).decode()}))
         pending.replace(self.state)
 
-    def start(self):
+    def start(self, text_fallback=False):
         self.process = subprocess.Popen([BINARY, str(self.host), str(self.script)],
                                         env={**os.environ, 'HOME': str(self.base),
                                              'PATH': str(self.base) + os.pathsep + os.environ['PATH'],
+                                             'WSL_CLIPBOARD_TEXT_FALLBACK': 'true' if text_fallback else 'false',
                                              'TEST_STATE': str(self.state), 'TEST_REQUESTS': str(self.log)},
                                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         def stop():
@@ -298,6 +303,20 @@ for line in sys.stdin:
         self.assertIn(text, self.read('text/html'))
         self.assertFalse(any(r.startswith(('PULL ', 'EXPORT ', 'EXIMAGE ')) for r in self.requests()))
 
+
+
+    def test_windows_text_after_application_reopens(self):
+        text = '  中文复制 😀\n' + '跨系统粘贴' * 4000 + '\n'
+        self.update('TEXT', [base64.b64encode(text.encode()).decode()])
+        self.start(text_fallback=True)
+        self.wait_for(lambda: 'UTF8_STRING' in (self.read('TARGETS') or ''))
+        self.assertFalse(any(r.startswith('PULL ') for r in self.requests()))
+        # Each xclip invocation is a newly opened X11 client.
+        self.assertEqual(self.read('UTF8_STRING'), text)
+        self.assertEqual(self.read('UTF8_STRING'), text)
+        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
+        self.assertFalse(any(r.startswith(('EXPORT ', 'EXIMAGE ')) for r in self.requests()))
+        self.assertFalse(self.cache.exists())
 
 
 if __name__ == '__main__': unittest.main()
