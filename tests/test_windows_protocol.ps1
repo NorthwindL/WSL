@@ -40,7 +40,6 @@ function Read-WindowsClipboard { $script:readCount++; return $script:originalDat
 $utf8 = New-Object Text.UTF8Encoding($false, $true)
 $bridgeMarker = 1000
 $pngFormat = 1001
-$textFallback = $false
 $window = @{ Handle = [IntPtr]::Zero }
 if ((Exchange 'POLL 1') -ne 'OTHER 2') { throw 'Non-file metadata failed' }
 if ((Exchange 'POLL 2') -ne 'SAME 2') { throw 'Unchanged sequence failed' }
@@ -88,17 +87,6 @@ $reads = $script:readCount
 if ((Exchange 'POLL 1') -ne 'IMAGE 2' -or $script:readCount -ne $reads) { throw 'Image metadata fetched data' }
 [ClipVersion]::HasText = $true
 if ((Exchange 'POLL 1') -ne 'OTHER 2' -or (Exchange 'PULL 2') -ne 'ERROR') { throw 'Mixed rich text was intercepted' }
-$textFallback = $true
-$text = "  测试456`r`n第二行  "
-$script:originalData = [pscustomobject]@{ Text = $text }
-$script:originalData | Add-Member ScriptMethod GetDataPresent { param($format, $auto) return $format -eq 'UnicodeText' }
-$script:originalData | Add-Member ScriptMethod GetData { param($format, $auto) return $this.Text }
-if ((Exchange 'POLL 1') -ne 'TEXT 2' -or $script:readCount -ne $reads) { throw 'Text metadata read clipboard data' }
-$reply = (Exchange 'PULL 2').Split(' ')
-if ($reply[0] -ne 'TEXT' -or (Decode $reply[2]) -cne $text.Replace("`r`n", "`n")) { throw 'Unicode plain text paste failed' }
-if ([ClipVersion]::Writes -ne 1) { throw 'Text import wrote to Windows' }
-$reads = $script:readCount
-$textFallback = $false
 [ClipVersion]::HasText = $false
 $bitmap = New-Object Drawing.Bitmap(2, 2)
 $stream = New-Object IO.MemoryStream
