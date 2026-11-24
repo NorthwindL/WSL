@@ -78,15 +78,34 @@ if ((Exchange ('EXPORT 2 ' + (Encode $linuxPath))) -ne 'OK 2') { throw 'Genuine 
 if ([ClipVersion]::Writes -ne 1) { throw 'Unexpected Windows clipboard write' }
 if ((Test-WslgCommandLine 'mstsc.exe /v:remote-host') -or
     !(Test-WslgCommandLine 'msrdc.exe /wslg')) { throw 'Ordinary RDP was confused with WSLg' }
-# Image metadata does not retrieve data, and rich text stays native even when
-# its clipboard also contains a bitmap representation.
+# Image and text metadata never retrieve content. Text takes priority over bitmap.
 Add-Type -AssemblyName System.Drawing
 [ClipVersion]::HasFiles = $false
 [ClipVersion]::HasImage = $true
 $reads = $script:readCount
 if ((Exchange 'POLL 1') -ne 'IMAGE 2' -or $script:readCount -ne $reads) { throw 'Image metadata fetched data' }
 [ClipVersion]::HasText = $true
-if ((Exchange 'POLL 1') -ne 'OTHER 2' -or (Exchange 'PULL 2') -ne 'ERROR') { throw 'Mixed rich text was intercepted' }
+if ((Exchange 'POLL 1') -ne 'TEXT 2' -or $script:readCount -ne $reads) { throw 'Text metadata read clipboard content' }
+$script:originalData = [pscustomobject]@{ Text = "中文`r`n第二行 😀`r第三行" }
+$script:originalData | Add-Member ScriptMethod GetDataPresent { param($format, $auto) return $format -eq 'UnicodeText' }
+$script:originalData | Add-Member ScriptMethod GetData { param($format, $auto) return $this.Text }
+if ((Exchange 'PULL 1') -ne 'CHANGED' -or $script:readCount -ne $reads) { throw 'Stale text paste read data' }
+$reply = (Exchange 'PULL 2').Split(' ')
+if ($reply[0] -ne 'TEXT' -or (Decode $reply[2]) -ne "中文`n第二行 😀`n第三行") { throw 'Unicode text paste failed' }
+if ($script:readCount -ne $reads + 1) { throw 'Text was not fetched exactly on PULL' }
+$script:originalData.Text = ''
+if ((Exchange 'PULL 2') -ne 'TEXT 2 ') { throw 'Empty Unicode text was not supported' }
+$writes = [ClipVersion]::Writes
+if ((Exchange ('EXTEXT 1 ' + (Encode '新文字'))) -ne 'CHANGED' -or [ClipVersion]::Writes -ne $writes) { throw 'Stale text publish changed Windows clipboard' }
+if ((Exchange ('EXTEXT 2 ' + (Encode "Linux 中文 😀`n第二行"))) -ne 'OK 2') { throw 'Linux Unicode export failed' }
+if ([ClipVersion]::LastFormats[0] -ne 13 -or [ClipVersion]::LastFormats[1] -ne $bridgeMarker -or
+    [Text.Encoding]::Unicode.GetString([ClipVersion]::LastPayload[0]) -ne ("Linux 中文 😀`r`n第二行" + [char]0)) { throw 'Windows Unicode payload or origin marker missing' }
+$writes = [ClipVersion]::Writes
+if ((Exchange ('EXTEXT 2 ' + (Encode ('x' + [char]0 + 'y')))) -ne 'ERROR' -or [ClipVersion]::Writes -ne $writes) { throw 'Embedded NUL corrupted Windows text' }
+[ClipVersion]::HasMarker = $true
+if ((Exchange 'POLL 1') -ne 'OTHER 2' -or (Exchange 'PULL 2') -ne 'ERROR') { throw 'Text export loop was not blocked' }
+[ClipVersion]::HasMarker = $false
+$reads = $script:readCount
 [ClipVersion]::HasText = $false
 $bitmap = New-Object Drawing.Bitmap(2, 2)
 $stream = New-Object IO.MemoryStream
@@ -122,4 +141,4 @@ if ((Exchange ('EXIMAGE 2 ' + [Convert]::ToBase64String($bmpStream.ToArray()))) 
     [ClipVersion]::LastPayload[0][0] -ne 137 -or [ClipVersion]::LastPayload[0][1] -ne 80) { throw 'BMP was not normalized into PNG for Windows' }
 $bmpStream.Dispose()
 $stream.Dispose()
-Write-Output 'Native text, lazy file/image paste, bitmap conversion and reverse PNG/DIB export checks passed.'
+Write-Output 'Lazy Unicode text, reverse Unicode export, lazy file/image paste, bitmap conversion and reverse PNG/DIB export checks passed.'
