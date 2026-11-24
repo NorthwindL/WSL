@@ -78,16 +78,25 @@ if ((Exchange ('EXPORT 2 ' + (Encode $linuxPath))) -ne 'OK 2') { throw 'Genuine 
 if ([ClipVersion]::Writes -ne 1) { throw 'Unexpected Windows clipboard write' }
 if ((Test-WslgCommandLine 'mstsc.exe /v:remote-host') -or
     !(Test-WslgCommandLine 'msrdc.exe /wslg')) { throw 'Ordinary RDP was confused with WSLg' }
-# Image metadata does not retrieve data, and rich text stays native even when
-# its clipboard also contains a bitmap representation.
+# Text data is retrieved only after PULL and published as UTF-8 plain text,
+# including when Windows also exposes an image representation.
 Add-Type -AssemblyName System.Drawing
 [ClipVersion]::HasFiles = $false
 [ClipVersion]::HasImage = $true
 $reads = $script:readCount
 if ((Exchange 'POLL 1') -ne 'IMAGE 2' -or $script:readCount -ne $reads) { throw 'Image metadata fetched data' }
 [ClipVersion]::HasText = $true
-if ((Exchange 'POLL 1') -ne 'OTHER 2' -or (Exchange 'PULL 2') -ne 'ERROR') { throw 'Mixed rich text was intercepted' }
+$text = "中文第一行`n第二行 😀"
+$script:originalData = [pscustomobject]@{ Text = $text }
+$script:originalData | Add-Member ScriptMethod GetDataPresent { param($format) return $format -eq 'UnicodeText' }
+$script:originalData | Add-Member ScriptMethod GetData { param($format) return $this.Text }
+if ((Exchange 'POLL 1') -ne 'TEXT 2' -or $script:readCount -ne $reads) { throw 'Text metadata read clipboard content' }
+$reply = (Exchange 'PULL 2').Split(' ')
+if ($reply[0] -ne 'TEXT' -or $reply[1] -ne '2' -or
+    [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($reply[2])) -ne $text) { throw 'UnicodeText was not encoded as UTF-8' }
+if ($script:readCount -ne $reads + 1) { throw 'Text was not read only on PULL' }
 [ClipVersion]::HasText = $false
+$reads = $script:readCount
 $bitmap = New-Object Drawing.Bitmap(2, 2)
 $stream = New-Object IO.MemoryStream
 $bitmap.SetPixel(0, 0, [Drawing.Color]::Red)
@@ -122,4 +131,4 @@ if ((Exchange ('EXIMAGE 2 ' + [Convert]::ToBase64String($bmpStream.ToArray()))) 
     [ClipVersion]::LastPayload[0][0] -ne 137 -or [ClipVersion]::LastPayload[0][1] -ne 80) { throw 'BMP was not normalized into PNG for Windows' }
 $bmpStream.Dispose()
 $stream.Dispose()
-Write-Output 'Native text, lazy file/image paste, bitmap conversion and reverse PNG/DIB export checks passed.'
+Write-Output 'Lazy UTF-8 text/file/image paste, bitmap conversion and reverse PNG/DIB export checks passed.'
