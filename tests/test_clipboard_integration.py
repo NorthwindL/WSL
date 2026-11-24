@@ -52,6 +52,7 @@ for line in sys.stdin:
     elif action == 'PULL':
         reply = ('FILES ' + seq + ' ' + ' '.join(base64.b64encode(p.encode()).decode() for p in state['paths'])
                  if parts[1] == seq and state['kind'] == 'FILES' else
+                 'TEXT ' + seq + ' ' + state['text'] if parts[1] == seq and state['kind'] == 'TEXT' else
                  'IMAGE ' + seq + ' ' + state['image'] if parts[1] == seq and state['kind'] == 'IMAGE' else 'CHANGED')
     elif action in ('EXPORT', 'EXIMAGE'):
         if parts[1] != seq: reply = 'CHANGED'
@@ -64,21 +65,35 @@ for line in sys.stdin:
     print(reply, flush=True)
 ''')
         self.host.chmod(0o700)
+        self.wl_copy_output = self.base / 'wl-copy.out'
+        self.wl_copy_args = self.base / 'wl-copy.args'
+        wl_copy = self.base / 'wl-copy'
+        wl_copy.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+Path(os.environ['TEST_WL_COPY_OUTPUT']).write_bytes(sys.stdin.buffer.read())
+Path(os.environ['TEST_WL_COPY_ARGS']).write_text(json.dumps(sys.argv[1:]))
+''')
+        wl_copy.chmod(0o700)
         self.script = self.base / 'backend.ps1'
         self.script.write_text('')
         self.cache = self.base / '.cache/wsl-clipboard/files'
 
-    def update(self, kind, paths=None):
+    def update(self, kind, paths=None, text=None):
         self.seq += 1
         pending = self.base / 'state.new'
-        pending.write_text(json.dumps({'sequence': str(self.seq), 'kind': kind, 'paths': paths or [], 'image': base64.b64encode(self.png).decode()}))
+        pending.write_text(json.dumps({'sequence': str(self.seq), 'kind': kind, 'paths': paths or [],
+                                       'text': base64.b64encode((text or '').encode()).decode(),
+                                       'image': base64.b64encode(self.png).decode()}))
         pending.replace(self.state)
 
     def start(self):
         self.process = subprocess.Popen([BINARY, str(self.host), str(self.script)],
                                         env={**os.environ, 'HOME': str(self.base),
                                              'PATH': str(self.base) + os.pathsep + os.environ['PATH'],
-                                             'TEST_STATE': str(self.state), 'TEST_REQUESTS': str(self.log)},
+                                             'TEST_STATE': str(self.state), 'TEST_REQUESTS': str(self.log),
+                                             'TEST_WL_COPY_OUTPUT': str(self.wl_copy_output),
+                                             'TEST_WL_COPY_ARGS': str(self.wl_copy_args)},
                                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         def stop():
             self.process.terminate()
@@ -280,6 +295,16 @@ for line in sys.stdin:
         request = next(r for r in self.requests() if r.startswith('EXIMAGE '))
         self.assertEqual(base64.b64decode(request.split(' ')[2]), bmp)
 
+
+    def test_windows_text_is_published_as_wayland_plain_text(self):
+        text = '中文第一行\n第二行 😀\n' + '长文本' * 3000
+        self.update('TEXT', text=text)
+        self.start()
+        self.wait_for(lambda: self.wl_copy_output.exists())
+        self.assertEqual(self.wl_copy_output.read_bytes(), text.encode())
+        self.assertEqual(json.loads(self.wl_copy_args.read_text()), ['--type', 'text/plain;charset=utf-8'])
+        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
+        self.assertFalse(self.cache.exists())
 
     @unittest.skipUnless(os.environ.get('MIXED_CLIPBOARD_BINARY'), 'requires a mixed-format application fixture')
     def test_mixed_text_and_image_copy_stays_native(self):

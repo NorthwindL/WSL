@@ -7,7 +7,7 @@ curl -fL --retry 3 https://raw.githubusercontent.com/NorthwindL/WSL/main/install
 bash /tmp/wsl-ai-install.sh
 ```
 
-默认安装中文字体、zh_CN.UTF-8、Fcitx5 中文输入法、fcitx5-configtool 和双向文件/图片桥接。文字保持 WSLg 原生通道，文件与截图按数据请求处理，不安装独立桌面、不强制应用切换显示后端。
+默认安装中文字体、zh_CN.UTF-8、Fcitx5 中文输入法、fcitx5-configtool 和双向文件/图片桥接。Windows UnicodeText 纯文本由桥接写入 Linux Wayland 剪贴板；截图保留 WSLg 原生通道，文件和图片仍按数据请求处理。不安装独立桌面、不强制应用切换显示后端。
 
 ## 文件传输何时执行
 
@@ -32,7 +32,7 @@ Ctrl+V、右键“粘贴”等操作只要目标应用请求上述文件数据�
 
 ## 文字交接与图片处理
 
-Windows 复制文字后，文件/图片桥接只使旧数据失效，不主动将 X11 剪贴板所有者设为空，交由 WSLg 原生文字所有者接管。Linux 复制文字时，同样不读取或重发布正文；含 UnicodeText 的 Windows 混合格式和含文字/HTML 的 Linux 混合格式优先走原生通道，避免表格、HTML 被图片或纯文字覆盖。
+Windows 剪贴板包含 UnicodeText 时，桥接读取该纯文本并通过 `wl-copy --type text/plain;charset=utf-8` 写入 Linux Wayland 剪贴板，适用于中文、多行和 Unicode 字符。若 Windows 剪贴板同时包含 HTML、RTF 或图片，当前实现仍以 UnicodeText 为准，Linux 收到纯文本，其他富文本/图片格式不随这次文本传输保留。Windows 仅含图片时仍由原生 WSLg 通道处理。Linux 复制文字、HTML 或混合内容时不读取或重发布正文，保持原有原生通道行为。
 
 图片按需读取为 PNG，Windows Bitmap 截图在请求时转换成 PNG。Linux 复制 PNG 或 BMP 时，Windows 同时收到 PNG、DIB 和来源标记，不把图片变成路径或文字。图片负载上限 64 MiB，图片数据不写入文件缓存。文件、图片、文字之间切换前核对剪贴板版本，避免向正在请求的应用返回已经失效的数据。
 
@@ -40,7 +40,7 @@ Windows 复制文字后，文件/图片桥接只使旧数据失效，不主动�
 
 缓存位于 `~/.cache/wsl-clipboard/files/copy-*`，目录权限 0700，文件补充当前用户读写权限。单次最多 512 MiB、10000 个文件及目录；复制前和复制中检查剩余空间，保留至少 64 MiB。拒绝符号链接及特殊文件，失败清理本次副本。每小时清理创建超过 24 小时的缓存；下次传输前也清理。长期使用的文件请另存。
 
-Windows 后端只在 `PULL` 请求中读取文件列表或图片；`POLL` 只报告数据类型，不读取正文、文件列表或图片。文字由原生通道处理。传输期间 Windows 剪贴板发生变化时，不向目标应用返回旧内容。反向文件复制仅接受 Windows 绝对路径或 WSL UNC 共享路径，禁止 POSIX 路径、缓存路径及旧暂存路径；写入前核对 Windows 剪贴板版本，避免覆盖较新的复制内容。
+Windows 后端的 `POLL` 只报告数据类型，不读取正文、文件列表或图片；收到对应的 `PULL` 后才读取文本、文件列表或图片。文本有 8 MiB 上限，文件列表有 4 MiB 上限，图片有 64 MiB 上限。传输期间 Windows 剪贴板发生变化时，不向 Linux 发布过期文本或文件/图片数据。反向文件复制仅接受 Windows 绝对路径或 WSL UNC 共享路径，禁止 POSIX 路径、缓存路径及旧暂存路径；写入前核对 Windows 剪贴板版本，避免覆盖较新的复制内容。
 
 ## 常用选项
 
@@ -65,7 +65,7 @@ bash /tmp/wsl-ai-install.sh --upgrade
 
 ## 验证与排查
 
-文字测试应特别覆盖：先复制文件，再复制中文、多行、emoji 和长文字；先复制截图，再复制文字/HTML；确认文件与图片格式声明不会阻止原生文字接管。还需验证 Windows 截图 → Linux 图片附件，以及 Linux PNG/BMP → Windows 图片粘贴。
+文字测试应特别覆盖：复制中文、多行、emoji 和长文字，确认 Linux Wayland 剪贴板收到对应 UTF-8 纯文本；确认 Windows 富文本混合格式按 UnicodeText 降为纯文本；先复制截图再复制文本，确认新文本接管。还需验证 Windows 截图 → Linux 图片附件，以及 Linux PNG/BMP → Windows 图片粘贴。
 
 1. 在 Windows 桌面复制 Excel 文件并粘贴副本，确认 Windows 原始操作正常。
 2. Windows 复制文件后，检查缓存没有新增；切换 Linux 窗口后仍不应新增。
@@ -87,4 +87,4 @@ bash -n install.sh
 python3 -m unittest discover -s tests -v
 ```
 
-CI 编译 QtCore/X11 程序，用真实 X11 数据请求和模拟 Windows 后端验证无预取、首次粘贴触发、重复粘贴复用、GNOME 文件格式、大选区 INCR、双向图片、反向文件复制、文件/图片到文字的所有权交接和混合格式原生保留。在 Windows 验证元数据轮询不读取文件/图片、只有粘贴请求可取数据、Bitmap→PNG 转换，以及 PNG/BMP 反向同步为正确的 PNG/DIB 格式。CI 不替代真实 Windows/RDP 的端到端验收。
+CI 编译 QtCore/X11 程序，用真实 X11 数据请求和模拟 Windows 后端验证无预取、首次粘贴触发、重复粘贴复用、GNOME 文件格式、大选区 INCR、Windows 纯文本写入 Wayland、双向图片、反向文件复制、文件/图片到文字的所有权交接和 Linux 混合格式原生保留。在 Windows 验证元数据轮询不读取文本/文件/图片、只有数据请求可取正文、UnicodeText UTF-8 编码、Bitmap→PNG 转换，以及 PNG/BMP 反向同步为正确的 PNG/DIB 格式。CI 不替代真实 Windows/RDP 的端到端验收。

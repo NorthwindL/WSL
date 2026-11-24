@@ -23,7 +23,7 @@ trap 'printf "\n安装在【%s】失败（第%s行）。修复报错后可重新
 usage() {
     cat <<'HELP'
 用法 bash install.sh [选项]
-默认启用双向文件桥接；文字和截图保留 WSLg 原生通道，仅在应用请求粘贴文件数据时传输，默认安装中文环境和 Fcitx5，不安装独立桌面。
+默认启用双向文件桥接；Windows 纯文本由桥接写入 Linux Wayland 剪贴板，截图保留 WSLg 原生通道，文件仅在应用请求粘贴文件数据时传输。默认安装中文环境和 Fcitx5，不安装独立桌面。
   --dry-run         显示安装计划，保持系统当前状态
   --check           检查依赖和后台服务状态
   --with-chinese    安装中文字体、语言和 Fcitx5 输入法（默认）
@@ -135,12 +135,17 @@ check_installation() {
 }
 
 preflight() {
+    local wayland_socket
     [[ $(id -u) -ne 0 ]] || fail '请用目标 Linux 普通用户运行，勿在命令前加 sudo。'
     [[ -f /etc/os-release ]] || fail '缺少发行版信息。'
     . /etc/os-release
     case "${ID:-}" in debian|ubuntu) ;; *) fail '支持 Debian 和 Ubuntu。' ;; esac
     [[ -n ${WSL_DISTRO_NAME:-} && -d /run/WSL ]] || fail '请在目标 WSL 的终端中运行。'
     [[ ${DISPLAY:-} =~ ^:[0-9]+(\.[0-9]+)?$ ]] || fail '请在 WSLg 图形终端运行，DISPLAY 应类似 :0。'
+    [[ -n ${WAYLAND_DISPLAY:-} && -n ${XDG_RUNTIME_DIR:-} ]] || fail 'Wayland 会话环境不完整。'
+    wayland_socket=$WAYLAND_DISPLAY
+    [[ $wayland_socket == /* ]] || wayland_socket="$XDG_RUNTIME_DIR/$wayland_socket"
+    [[ -S $wayland_socket ]] || fail '找不到当前 Wayland 会话 socket。'
     [[ $WSL_DISTRO_NAME =~ ^[A-Za-z0-9._-]+$ ]] || fail '发行版名称包含暂未支持的字符。'
     [[ $CONFIG_DIR == "$HOME/.config" ]] || fail '当前版本要求 XDG_CONFIG_HOME 使用默认 ~/.config。'
     command -v sudo >/dev/null || fail '请先由管理员安装 sudo 并授予当前用户 sudo 权限。'
@@ -421,6 +426,7 @@ class Bridge {
     QTimer timer;
     std::unique_ptr<QSocketNotifier> notifier;
     QByteArray version = "-1", offered, offeredKind, loadingVersion, cached;
+    qint64 textRetryAt = 0;
     QList<XSelectionRequestEvent> pending;
     bool receiving = false;
     Atom requested = 0;
@@ -431,9 +437,26 @@ class Bridge {
     static constexpr int chunk = 32768;
     static constexpr int maxUris = 4 * 1024 * 1024;
     static constexpr int maxImage = 64 * 1024 * 1024;
+    static constexpr int maxText = 8 * 1024 * 1024;
     Atom incomingTarget = 0;
     bool validPng(const QByteArray &bytes) {
         return bytes.size() <= maxImage && bytes.startsWith(QByteArray::fromHex("89504e470d0a1a0a"));
+    }
+
+    bool publishText(const QByteArray &encoded) {
+        const QByteArray text = encoded == "-" ? QByteArray() : QByteArray::fromBase64(encoded);
+        if (text.size() > maxText) return false;
+        QProcess copy;
+        copy.start("wl-copy", {"--type", "text/plain;charset=utf-8"});
+        if (!copy.waitForStarted(5000)) return false;
+        if (!text.isEmpty() && copy.write(text) < 0) {
+            copy.kill(); copy.waitForFinished(); return false;
+        }
+        copy.closeWriteChannel();
+        if (!copy.waitForFinished(10000)) {
+            copy.kill(); copy.waitForFinished(); return false;
+        }
+        return copy.exitStatus() == QProcess::NormalExit && copy.exitCode() == 0;
     }
 
     QList<QByteArray> exchange(const QByteArray &request) {
@@ -640,6 +663,21 @@ class Bridge {
         if (state.first() == "ECHO") {
             version = state.value(1);
             if (sourceOwner && sourceOwner == XGetSelectionOwner(d, clipboard)) exportVersion = version;
+        }
+        if (state.first() == "TEXT") {
+            const auto textVersion = state.value(1);
+            if (QDateTime::currentMSecsSinceEpoch() >= textRetryAt) {
+                offered.clear(); cancelLoad(); requested = 0; receiving = false;
+                offeredKind.clear();
+                const auto frame = exchange("PULL " + textVersion);
+                if (frame.first() == "TEXT" && frame.value(1) == textVersion && frame.size() == 3 && publishText(frame.value(2))) {
+                    version = textVersion;
+                    textRetryAt = 0;
+                } else {
+                    textRetryAt = QDateTime::currentMSecsSinceEpoch() + 1000;
+                    qWarning() << "Unable to publish Windows text to the Wayland clipboard; retrying";
+                }
+            }
         }
         if (state.first() == "FILES" || state.first() == "IMAGE" || state.first() == "OTHER") {
             version = state.value(1);
@@ -886,8 +924,7 @@ function Exchange([string]$request) {
         if ([ClipVersion]::IsClipboardFormatAvailable($bridgeMarker)) { return "OTHER $sequence" }
         if (Test-WslgClipboardOwner) { return "ECHO $sequence" }
         if ([ClipVersion]::IsClipboardFormatAvailable(15)) { return "FILES $sequence" }
-        # Mixed rich-text/image selections are text and stay on the native path.
-        if ([ClipVersion]::IsClipboardFormatAvailable(13)) { return "OTHER $sequence" }
+        if ([ClipVersion]::IsClipboardFormatAvailable(13)) { return "TEXT $sequence" }
         if (Test-WindowsImageFormat) { return "IMAGE $sequence" }
         return "OTHER $sequence"
     }
@@ -902,7 +939,17 @@ function Exchange([string]$request) {
             if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
             return "FILES $sequence " + ($paths -join ' ')
         }
-        if ([ClipVersion]::IsClipboardFormatAvailable(13) -or !(Test-WindowsImageFormat)) { return 'ERROR' }
+        if ([ClipVersion]::IsClipboardFormatAvailable(13)) {
+            $data = Read-WindowsClipboard
+            if (!$data -or !$data.GetDataPresent('UnicodeText')) { return 'ERROR' }
+            $text = [string]$data.GetData('UnicodeText')
+            $bytes = $utf8.GetBytes($text)
+            if ($bytes.Length -gt 8388608) { return 'ERROR' }
+            if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
+            $payload = if ($bytes.Length) { [Convert]::ToBase64String($bytes) } else { '-' }
+            return "TEXT $sequence $payload"
+        }
+        if (!(Test-WindowsImageFormat)) { return 'ERROR' }
         $bytes = Read-WindowsPng (Read-WindowsClipboard)
         if (!$bytes -or $bytes.Length -gt 67108864) { return 'ERROR' }
         if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
@@ -989,11 +1036,13 @@ exit 1
 DESKTOP_START
     write_user_file "$service_dir/wsl-clipboard-desktop.service" 644 <<SERVICE
 [Unit]
-Description=WSL file clipboard transfer on application data requests
+Description=WSL clipboard bridge for Windows text and application-requested files
 StartLimitIntervalSec=0
 [Service]
 ExecStart=%h/.local/bin/wsl-clipboard-desktop-start
 Environment="DISPLAY=$DISPLAY"
+Environment="WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+Environment="XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
 Environment="WSL_DISTRO_NAME=$WSL_DISTRO_NAME"
 Restart=on-failure
 RestartSec=3
@@ -1056,8 +1105,16 @@ main() {
     parse_args "$@"
     if [[ $DRY_RUN == true ]]; then
         printf '计划安装中文环境=%s，系统升级=%s\n' "$([[ $INSTALL_CHINESE == true ]] && echo 是 || echo 否)" "$UPGRADE"
-        printf '剪贴板模式=%s；Windows 文件仅在 Linux 应用请求文件数据时传输。\n' "$CLIPBOARD_MODE"
-        printf 'Windows 复制、窗口切换和格式探测不读取文件列表、不创建缓存；文字图片保留原生通道。\n'
+        printf '剪贴板模式=%s；' "$CLIPBOARD_MODE"
+        if [[ $CLIPBOARD_MODE == files ]]; then
+            printf 'Windows 文件仅在 Linux 应用请求文件数据时传输。\n'
+            printf 'Windows 复制、窗口切换和格式探测不读取文件列表、不创建缓存；'
+            printf '纯文本经桥接写入 Wayland，图片保留原生通道。\n'
+        else
+            printf '桥接关闭，不传输 Windows 文件。\n'
+            printf 'Windows 复制、窗口切换和格式探测不读取文件列表、不创建缓存；'
+            printf '桥接已关闭，文本和图片均由 WSLg 原生通道处理。\n'
+        fi
         return
     fi
     if [[ $CHECK_ONLY == true ]]; then check_installation; return; fi
