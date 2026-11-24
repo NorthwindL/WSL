@@ -11,7 +11,7 @@ jobs:
         run: |
           bash -n install.sh
           python3 -m unittest discover -s tests -v
-      - name: Compile QtCore/X11 clipboard bridge
+      - name: Compile QtCore/X11 file bridge
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -21,7 +21,7 @@ jobs:
           g++ -std=c++17 -Wall -Wextra -O2 -fPIC /tmp/session.cpp -o /tmp/session $(pkg-config --cflags --libs Qt5Core x11)
       - name: Compile mixed-format clipboard application fixture
         run: g++ -std=c++17 -O2 -fPIC tests/mixed_clipboard.cpp -o /tmp/mixed-clipboard $(pkg-config --cflags --libs Qt5Gui)
-      - name: Verify lazy X11 text, file and image clipboard requests
+      - name: Verify lazy X11 clipboard data and native text handoff
         run: QT_BRIDGE_BINARY=/tmp/session MIXED_CLIPBOARD_BINARY=/tmp/mixed-clipboard xvfb-run -a python3 -m unittest discover -s tests -p test_clipboard_integration.py -v
   windows-protocol:
     runs-on: windows-latest

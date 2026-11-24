@@ -23,13 +23,13 @@ trap 'printf "\n安装在【%s】失败（第%s行）。修复报错后可重新
 usage() {
     cat <<'HELP'
 用法 bash install.sh [选项]
-默认启用文字、文件、图片双向桥接；Windows 内容仅在 Linux 应用请求粘贴数据时读取，默认安装中文环境和 Fcitx5，不安装独立桌面。
+默认启用双向文件桥接；文字和截图保留 WSLg 原生通道，仅在应用请求粘贴文件数据时传输，默认安装中文环境和 Fcitx5，不安装独立桌面。
   --dry-run         显示安装计划，保持系统当前状态
   --check           检查依赖和后台服务状态
   --with-chinese    安装中文字体、语言和 Fcitx5 输入法（默认）
   --without-chinese 不安装中文字体、语言和 Fcitx5 输入法
-  --native          停用全部脚本桥接，恢复系统原生行为
-  --with-files      启用文字、文件、图片双向桥接（默认，兼容旧参数）
+  --native          仅原生通道，显式关闭文件桥接
+  --with-files      按应用数据请求触发的双向文件桥接（默认）
   --upgrade         显式执行系统软件升级
   --skip-upgrade    跳过系统软件升级
   -h, --help        显示帮助
@@ -416,14 +416,13 @@ static QString mapPath(const QString &flag, const QString &path) {
 class Bridge {
     Display *d = nullptr;
     Window window = 0, observed = 0, sourceOwner = 0;
-    Atom clipboard, targets, uri, gnome, png, bmp, utf8, plain, plainUtf8, textAtom, incr, property;
+    Atom clipboard, targets, uri, gnome, png, bmp, utf8, plain, plainUtf8, html, textAtom, incr, property;
     QProcess host, stage;
     QTimer timer;
     std::unique_ptr<QSocketNotifier> notifier;
     QByteArray version = "-1", offered, offeredKind, loadingVersion, cached;
     QList<XSelectionRequestEvent> pending;
-    bool receiving = false, cachedReady = false;
-    QByteArray lastText, lastTextVersion;
+    bool receiving = false;
     Atom requested = 0;
     QByteArray incoming, exportVersion;
     QElapsedTimer sourceDeadline, stageDeadline;
@@ -432,18 +431,6 @@ class Bridge {
     static constexpr int chunk = 32768;
     static constexpr int maxUris = 4 * 1024 * 1024;
     static constexpr int maxImage = 64 * 1024 * 1024;
-    static constexpr int maxText = 8 * 1024 * 1024;
-    bool textTarget(Atom target) const {
-        return target == utf8 || target == plainUtf8 || target == plain || target == textAtom || target == XA_STRING;
-    }
-    bool validText(const QByteArray &bytes) const {
-        QTextCodec::ConverterState state;
-        QTextCodec::codecForName("UTF-8")->toUnicode(bytes.constData(), bytes.size(), &state);
-        return bytes.size() <= maxText && state.invalidChars == 0 && state.remainingChars == 0 && !bytes.contains('\0');
-    }
-    int dataLimit(Atom target) const {
-        return (target == png || target == bmp) ? maxImage : (textTarget(target) ? maxText : maxUris);
-    }
     Atom incomingTarget = 0;
     bool validPng(const QByteArray &bytes) {
         return bytes.size() <= maxImage && bytes.startsWith(QByteArray::fromHex("89504e470d0a1a0a"));
@@ -458,10 +445,7 @@ class Bridge {
             if (host.state() == QProcess::NotRunning) break;
         }
         if (!host.canReadLine()) { QCoreApplication::exit(1); return {"ERROR"}; }
-        QByteArray line = host.readLine();
-        if (line.endsWith('\n')) line.chop(1);
-        if (line.endsWith('\r')) line.chop(1);
-        return line.split(' ');
+        return host.readLine().trimmed().split(' ');
     }
     void notify(const XSelectionRequestEvent &r, Atom result) {
         XEvent e{}; e.xselection.type = SelectionNotify;
@@ -472,16 +456,15 @@ class Bridge {
     }
     void reply(const XSelectionRequestEvent &r, const QByteArray &data) {
         Atom prop = r.property == None ? r.target : r.property;
-        const Atom encoding = r.target == textAtom ? utf8 : r.target;
         if (data.size() <= chunk) {
-            XChangeProperty(d, r.requestor, prop, encoding, 8, PropModeReplace,
+            XChangeProperty(d, r.requestor, prop, r.target, 8, PropModeReplace,
                             reinterpret_cast<const unsigned char *>(data.constData()), data.size());
         } else {
             unsigned long size = data.size();
             XSelectInput(d, r.requestor, PropertyChangeMask);
             XChangeProperty(d, r.requestor, prop, incr, 32, PropModeReplace,
                             reinterpret_cast<unsigned char *>(&size), 1);
-            transfers.append({r.requestor, prop, encoding, data, 0, QDateTime::currentMSecsSinceEpoch()});
+            transfers.append({r.requestor, prop, r.target, data, 0, QDateTime::currentMSecsSinceEpoch()});
         }
         notify(r, prop);
     }
@@ -491,7 +474,7 @@ class Bridge {
         if (stage.state() != QProcess::NotRunning) {
             stage.terminate(); if (!stage.waitForFinished(1000)) { stage.kill(); stage.waitForFinished(); }
         }
-        failPending(); cached.clear(); cachedReady = false;
+        failPending(); cached.clear();
     }
     void selectionRequest(const XSelectionRequestEvent &r) {
         if (r.selection != clipboard || offered.isEmpty() || XGetSelectionOwner(d, clipboard) != window) {
@@ -501,18 +484,14 @@ class Bridge {
         if (r.target == targets) {
             const Atom fileFormats[] = {targets, uri, gnome};
             const Atom imageFormats[] = {targets, png};
-            const Atom textFormats[] = {targets, utf8, plainUtf8, plain, textAtom};
-            const bool image = offeredKind == "IMAGE", text = offeredKind == "TEXT";
-            const Atom *formats = text ? textFormats : (image ? imageFormats : fileFormats);
+            const bool image = offeredKind == "IMAGE";
             XChangeProperty(d, r.requestor, prop, XA_ATOM, 32, PropModeReplace,
-                            reinterpret_cast<const unsigned char *>(formats), text ? 5 : (image ? 2 : 3));
+                            reinterpret_cast<const unsigned char *>(image ? imageFormats : fileFormats), image ? 2 : 3);
             notify(r, prop); return; // Format probes never fetch Windows paths or stage files.
         }
-        const bool text = offeredKind == "TEXT";
-        const bool supported = text ? (r.target == utf8 || r.target == plainUtf8 || r.target == plain || r.target == textAtom)
-            : (offeredKind == "IMAGE" ? r.target == png : (r.target == uri || r.target == gnome));
+        const bool supported = offeredKind == "IMAGE" ? r.target == png : (r.target == uri || r.target == gnome);
         if (!supported || r.requestor == window) { notify(r, None); return; }
-        if (cachedReady) {
+        if (!cached.isEmpty()) {
             if (exchange("CHECK " + offered).first() != "CURRENT") { notify(r, None); return; }
             reply(r, r.target == gnome ? "copy\n" + QByteArray(cached).replace("\r\n", "\n") : cached); return;
         }
@@ -520,11 +499,10 @@ class Bridge {
         if (!loadingVersion.isEmpty()) return;
         const auto frame = exchange("PULL " + offered);
         if (frame.first() != offeredKind || frame.value(1) != offered || frame.size() < 3) { failPending(); return; }
-        if (text || offeredKind == "IMAGE") {
+        if (offeredKind == "IMAGE") {
             const auto image = QByteArray::fromBase64(frame.value(2));
-            if (!(text ? validText(image) : validPng(image)) || exchange("CHECK " + offered).first() != "CURRENT") { failPending(); return; }
-            cached = image; cachedReady = true;
-            if (text) { lastText = cached; lastTextVersion = offered; }
+            if (!validPng(image) || exchange("CHECK " + offered).first() != "CURRENT") { failPending(); return; }
+            cached = image;
             for (const auto &request : pending) reply(request, cached);
             pending.clear(); return;
         }
@@ -558,13 +536,13 @@ class Bridge {
             if (root.startsWith(cache + "copy-")) QDir(root).removeRecursively();
             failPending(); return;
         }
-        cached = urls; cachedReady = true;
+        cached = urls;
         for (const auto &r : pending) reply(r, r.target == gnome ? "copy\n" + QByteArray(cached).replace("\r\n", "\n") : cached);
         pending.clear();
     }
     QByteArray getProperty(Atom &type, int &format, unsigned long &count) {
         unsigned char *raw = nullptr; unsigned long after = 0;
-        const int limit = dataLimit(requested);
+        const int limit = (requested == png || requested == bmp) ? maxImage : maxUris;
         if (XGetWindowProperty(d, window, property, 0, limit / 4, True, AnyPropertyType,
                                &type, &format, &count, &after, &raw) != Success) return {};
         // Xlib returns format-32 values as native unsigned longs.
@@ -598,18 +576,6 @@ class Bridge {
         // Never retry an old local offer after a newer Windows copy.
     }
     void exportData(const QByteArray &bytes, Atom type) {
-        if (textTarget(type)) {
-            if (XGetSelectionOwner(d, clipboard) != sourceOwner) return;
-            const QByteArray text = (type == XA_STRING ? QString::fromLatin1(bytes).toUtf8() : bytes);
-            if (!validText(text)) return;
-            // A native echo of the same local offer must not cause a publish loop.
-            if (text == lastText && exportVersion == lastTextVersion) return;
-            const auto response = exchange("EXTEXT " + exportVersion + " " + text.toBase64());
-            if (response.first() == "OK") {
-                version = response.value(1); lastText = text; lastTextVersion = version;
-            }
-            return;
-        }
         if (type != png && type != bmp) { exportFiles(bytes); return; }
         const bool image = type == png ? validPng(bytes) : (bytes.size() >= 14 && bytes.size() <= maxImage && bytes.startsWith("BM"));
         if (!image || XGetSelectionOwner(d, clipboard) != sourceOwner) return;
@@ -623,25 +589,23 @@ class Bridge {
         const auto bytes = getProperty(type, format, count);
         if (!requested) return;
         if (requested == targets) {
-            bool hasUris = false, hasGnome = false, hasPng = false, hasBmp = false;
-            Atom textFormat = 0; int textRank = 100;
+            bool hasUris = false, hasGnome = false, hasPng = false, hasBmp = false, hasText = false;
             if (type == XA_ATOM && format == 32) for (unsigned long i = 0; i < count; i++) {
                 unsigned long atom = 0; memcpy(&atom, bytes.constData() + i * sizeof(atom), sizeof(atom));
                 if (atom == uri) hasUris = true;
                 if (atom == gnome) hasGnome = true;
                 if (atom == png) hasPng = true;
                 if (atom == bmp) hasBmp = true;
-                const int rank = atom == utf8 ? 0 : (atom == plainUtf8 ? 1 : (atom == plain ? 2 : (atom == XA_STRING ? 3 : 100)));
-                if (rank < textRank) { textRank = rank; textFormat = atom; }
+                if (atom == utf8 || atom == plain || atom == plainUtf8 || atom == html || atom == textAtom || atom == XA_STRING) hasText = true;
             }
-            if (!hasUris && !hasGnome && !textFormat && !hasPng && !hasBmp) { requested = 0; return; }
-            requested = hasUris ? uri : (hasGnome ? gnome : (textFormat ? textFormat : (hasPng ? png : bmp)));
+            if ((!hasUris && !hasGnome && hasText) || (!hasUris && !hasGnome && !hasPng && !hasBmp)) { requested = 0; return; }
+            requested = hasUris ? uri : (hasGnome ? gnome : (hasPng ? png : bmp));
             XConvertSelection(d, clipboard, requested, property, window, CurrentTime); XFlush(d); return;
         }
         if (type == incr) { receiving = true; incomingTarget = requested; incoming.clear(); XFlush(d); return; }
         const Atom target = requested;
         requested = 0;
-        if (format == 8) exportData(bytes, textTarget(target) ? type : target);
+        if (format == 8) exportData(bytes, target);
     }
     void events() {
         while (XPending(d)) {
@@ -654,7 +618,7 @@ class Bridge {
                 if (e.xproperty.window == window && e.xproperty.atom == property && receiving && e.xproperty.state == PropertyNewValue) {
                     Atom type = 0; int format = 0; unsigned long count = 0;
                     const auto bytes = getProperty(type, format, count);
-                    if (!requested || format != 8 || incoming.size() + bytes.size() > dataLimit(incomingTarget)) { receiving = false; requested = 0; }
+                    if (!requested || format != 8 || incoming.size() + bytes.size() > ((incomingTarget == png || incomingTarget == bmp) ? maxImage : maxUris)) { receiving = false; requested = 0; }
                     else if (bytes.isEmpty()) { receiving = false; requested = 0; exportData(incoming, incomingTarget); incoming.clear(); }
                     else incoming += bytes;
                     XFlush(d);
@@ -676,20 +640,19 @@ class Bridge {
         if (state.first() == "ECHO") {
             version = state.value(1);
             if (sourceOwner && sourceOwner == XGetSelectionOwner(d, clipboard)) exportVersion = version;
-            if (!lastTextVersion.isEmpty()) lastTextVersion = version;
-            if (cachedReady && XGetSelectionOwner(d, clipboard) == window) offered = version;
         }
-        const bool hasOffer = state.first() == "FILES" || state.first() == "IMAGE" || state.first() == "TEXT";
-        if (hasOffer || state.first() == "OTHER") {
+        if (state.first() == "FILES" || state.first() == "IMAGE" || state.first() == "OTHER") {
             version = state.value(1);
             offered.clear(); cancelLoad(); requested = 0; receiving = false;
             offeredKind.clear();
-            if (hasOffer) {
+            if (state.first() == "FILES" || state.first() == "IMAGE") {
                 offered = version; offeredKind = state.first();
                 XSetSelectionOwner(d, clipboard, window, CurrentTime); XFlush(d);
                 observed = window;
             }
-            // Unsupported formats invalidate our data without clearing Windows through native sync.
+            // For text/HTML, invalidate only our old data. Do not clear X11
+            // ownership: an empty selection can be mirrored back into Windows
+            // before WSLg's native text owner finishes taking over.
         }
         const Window owner = XGetSelectionOwner(d, clipboard);
         if (owner != observed) {
@@ -716,20 +679,17 @@ public:
         uri = XInternAtom(d, "text/uri-list", False); gnome = XInternAtom(d, "x-special/gnome-copied-files", False);
         png = XInternAtom(d, "image/png", False); bmp = XInternAtom(d, "image/bmp", False);
         utf8 = XInternAtom(d, "UTF8_STRING", False); plain = XInternAtom(d, "text/plain", False);
-        plainUtf8 = XInternAtom(d, "text/plain;charset=utf-8", False);
+        plainUtf8 = XInternAtom(d, "text/plain;charset=utf-8", False); html = XInternAtom(d, "text/html", False);
         textAtom = XInternAtom(d, "TEXT", False);
         incr = XInternAtom(d, "INCR", False); property = XInternAtom(d, "_WSL_FILE_SOURCE", False);
         QFile file(scriptPath); if (!file.open(QIODevice::ReadOnly)) return false;
         QString source = QString::fromUtf8(file.readAll());
         const auto identity = QCryptographicHash::hash(qgetenv("WSL_DISTRO_NAME") + '\n' + qgetenv("DISPLAY"), QCryptographicHash::Sha256).toHex();
         source.prepend("$desktopIdentity = '" + QString::fromLatin1(identity) + "'\n");
-        // Load source on stdin: embedded backend size must not exceed the Windows command-line limit.
-        const QString loader = QStringLiteral(
-            "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::ReadLine()))))");
-        QByteArray utf16(reinterpret_cast<const char *>(loader.utf16()), loader.size() * 2);
+        QByteArray utf16(reinterpret_cast<const char *>(source.utf16()), source.size() * 2);
         host.setProcessChannelMode(QProcess::ForwardedErrorChannel);
         host.start(powershell, {"-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", utf16.toBase64()});
-        if (!host.waitForStarted() || host.write(source.toUtf8().toBase64() + '\n') < 0) return false;
+        if (!host.waitForStarted()) return false;
         QObject::connect(&stage, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
                          [this](int code, QProcess::ExitStatus status) { staged(code, status); });
         notifier = std::make_unique<QSocketNotifier>(ConnectionNumber(d), QSocketNotifier::Read);
@@ -926,8 +886,8 @@ function Exchange([string]$request) {
         if ([ClipVersion]::IsClipboardFormatAvailable($bridgeMarker)) { return "OTHER $sequence" }
         if (Test-WslgClipboardOwner) { return "ECHO $sequence" }
         if ([ClipVersion]::IsClipboardFormatAvailable(15)) { return "FILES $sequence" }
-        # Prefer text over an image representation of the same rich-text selection.
-        if ([ClipVersion]::IsClipboardFormatAvailable(13)) { return "TEXT $sequence" }
+        # Mixed rich-text/image selections are text and stay on the native path.
+        if ([ClipVersion]::IsClipboardFormatAvailable(13)) { return "OTHER $sequence" }
         if (Test-WindowsImageFormat) { return "IMAGE $sequence" }
         return "OTHER $sequence"
     }
@@ -942,32 +902,11 @@ function Exchange([string]$request) {
             if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
             return "FILES $sequence " + ($paths -join ' ')
         }
-        if ([ClipVersion]::IsClipboardFormatAvailable(13)) {
-            # Never ask the native echo to render our own delayed selection back to us.
-            if (Test-WslgClipboardOwner) { return 'ERROR' }
-            $data = Read-WindowsClipboard
-            if (!$data -or !$data.GetDataPresent('UnicodeText', $false)) { return 'ERROR' }
-            $text = ([string]$data.GetData('UnicodeText', $false)).Replace("`r`n", "`n").Replace("`r", "`n")
-            if ($utf8.GetByteCount($text) -gt 8388608 -or $text.Contains([string][char]0)) { return 'ERROR' }
-            if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
-            return "TEXT $sequence " + (Encode $text)
-        }
-        if (!(Test-WindowsImageFormat)) { return 'ERROR' }
+        if ([ClipVersion]::IsClipboardFormatAvailable(13) -or !(Test-WindowsImageFormat)) { return 'ERROR' }
         $bytes = Read-WindowsPng (Read-WindowsClipboard)
         if (!$bytes -or $bytes.Length -gt 67108864) { return 'ERROR' }
         if ([ClipVersion]::GetClipboardSequenceNumber() -ne $sequence) { return 'CHANGED' }
         return "IMAGE $sequence " + [Convert]::ToBase64String($bytes)
-    }
-    if ($parts[0] -eq 'EXTEXT') {
-        if ($parts[1] -ne [string]$sequence) { return 'CHANGED' }
-        if ($parts.Length -ne 3) { return 'ERROR' }
-        $text = Decode $parts[2]
-        if ($utf8.GetByteCount($text) -gt 8388608 -or $text.Contains([string][char]0)) { return 'ERROR' }
-        $text = $text.Replace("`r`n", "`n").Replace("`r", "`n").Replace("`n", "`r`n")
-        $payloads = [Collections.Generic.List[byte[]]]::new()
-        $payloads.Add([Text.Encoding]::Unicode.GetBytes($text + [char]0))
-        $payloads.Add([byte[]]@(1))
-        return [ClipVersion]::Publish($window.Handle, $sequence, [uint32[]]@(13, $bridgeMarker), $payloads.ToArray())
     }
     if ($parts[0] -eq 'EXIMAGE') {
         if ($parts[1] -ne [string]$sequence) { return 'CHANGED' }
@@ -1118,7 +1057,7 @@ main() {
     if [[ $DRY_RUN == true ]]; then
         printf '计划安装中文环境=%s，系统升级=%s\n' "$([[ $INSTALL_CHINESE == true ]] && echo 是 || echo 否)" "$UPGRADE"
         printf '剪贴板模式=%s；Windows 文件仅在 Linux 应用请求文件数据时传输。\n' "$CLIPBOARD_MODE"
-        printf 'Windows 复制、窗口切换和格式探测不读取文件列表、不创建缓存；文字、图片、文件均由脚本按数据请求读取。\n'
+        printf 'Windows 复制、窗口切换和格式探测不读取文件列表、不创建缓存；文字图片保留原生通道。\n'
         return
     fi
     if [[ $CHECK_ONLY == true ]]; then check_installation; return; fi

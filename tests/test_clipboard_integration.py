@@ -1,5 +1,6 @@
 """Real X11 selection requests with a simulated Windows metadata/data backend."""
 import base64
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -38,8 +39,6 @@ class ClipboardIntegrationTests(unittest.TestCase):
         self.host.write_text('''#!/usr/bin/env python3
 import base64, json, os, sys
 from pathlib import Path
-# First line loads the real PowerShell backend; it is not a clipboard request.
-sys.stdin.readline()
 for line in sys.stdin:
     with open(os.environ['TEST_REQUESTS'], 'a') as log: log.write(line)
     parts = line.strip().split(' ')
@@ -53,9 +52,8 @@ for line in sys.stdin:
     elif action == 'PULL':
         reply = ('FILES ' + seq + ' ' + ' '.join(base64.b64encode(p.encode()).decode() for p in state['paths'])
                  if parts[1] == seq and state['kind'] == 'FILES' else
-                 'IMAGE ' + seq + ' ' + state['image'] if parts[1] == seq and state['kind'] == 'IMAGE' else
-                 'TEXT ' + seq + ' ' + state['text'] if parts[1] == seq and state['kind'] == 'TEXT' else 'CHANGED')
-    elif action in ('EXPORT', 'EXIMAGE', 'EXTEXT'):
+                 'IMAGE ' + seq + ' ' + state['image'] if parts[1] == seq and state['kind'] == 'IMAGE' else 'CHANGED')
+    elif action in ('EXPORT', 'EXIMAGE'):
         if parts[1] != seq: reply = 'CHANGED'
         else:
             seq = str(int(seq) + 1)
@@ -70,10 +68,10 @@ for line in sys.stdin:
         self.script.write_text('')
         self.cache = self.base / '.cache/wsl-clipboard/files'
 
-    def update(self, kind, paths=None, text="中文第一行\n第二行 😀"):
+    def update(self, kind, paths=None):
         self.seq += 1
         pending = self.base / 'state.new'
-        pending.write_text(json.dumps({'sequence': str(self.seq), 'kind': kind, 'paths': paths or [], 'image': base64.b64encode(self.png).decode(), 'text': base64.b64encode(text.encode()).decode()}))
+        pending.write_text(json.dumps({'sequence': str(self.seq), 'kind': kind, 'paths': paths or [], 'image': base64.b64encode(self.png).decode()}))
         pending.replace(self.state)
 
     def start(self):
@@ -240,61 +238,28 @@ for line in sys.stdin:
         self.assertEqual(self.read_bytes('image/png'), self.png)
         self.assertFalse(self.cache.exists())
 
-    def test_file_to_text_offer_and_lazy_unicode_paste(self):
+    def test_file_to_native_text_handoff_does_not_clear_selection(self):
         self.start(); self.wait_targets()
-        text = '中文第一行\n第二行 😀'
-        self.update('TEXT', text=text)
-        self.wait_for(lambda: 'UTF8_STRING' in (self.read('TARGETS') or ''))
-        self.assertNotIn('text/uri-list', self.read('TARGETS'))
-        time.sleep(0.6)
-        self.assertFalse(any(r.startswith(('PULL ', 'EXPORT ', 'EXTEXT ')) for r in self.requests()))
-        self.assertEqual(self.read('UTF8_STRING'), text)
-        self.assertEqual(self.read('text/plain;charset=utf-8'), text)
-        self.assertEqual(self.read('TEXT'), text)
-        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
-        self.assertFalse(self.cache.exists())
-
-    def test_large_windows_text_uses_incr(self):
-        text = '中文 😀 多行\n' * 15000
-        self.update('TEXT', text=text); self.start()
-        self.wait_for(lambda: 'UTF8_STRING' in (self.read('TARGETS') or ''))
-        self.assertEqual(self.read('UTF8_STRING', timeout=20), text)
-        self.assertEqual(self.read('text/plain', timeout=20), text)
-        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
-
-    def test_empty_text_paste_is_cached(self):
-        self.update('TEXT', text=''); self.start()
-        self.wait_for(lambda: 'UTF8_STRING' in (self.read('TARGETS') or ''))
-        self.assertEqual(self.read('UTF8_STRING'), '')
-        self.assertEqual(self.read('UTF8_STRING'), '')
-        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 1)
-
-    def test_linux_text_copy_exports_unicode_without_import(self):
-        self.update('OTHER'); self.start()
-        text = 'Linux 中文 😀\n第二行' * 6000
-        self.own('UTF8_STRING', text)
-        self.wait_for(lambda: any(r.startswith('EXTEXT ') for r in self.requests()))
-        request = next(r for r in self.requests() if r.startswith('EXTEXT '))
-        self.assertEqual(base64.b64decode(request.split(' ')[2]).decode(), text)
+        x11 = ctypes.CDLL('libX11.so.6')
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x11.XInternAtom.restype = ctypes.c_ulong
+        x11.XGetSelectionOwner.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x11.XGetSelectionOwner.restype = ctypes.c_ulong
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        display = x11.XOpenDisplay(None)
+        self.assertTrue(display)
+        self.addCleanup(lambda: x11.XCloseDisplay(display))
+        clipboard = x11.XInternAtom(display, b'CLIPBOARD', 0)
+        old_owner = x11.XGetSelectionOwner(display, clipboard)
+        self.assertNotEqual(old_owner, 0)
+        self.update('OTHER'); time.sleep(0.6)
+        self.assertEqual(x11.XGetSelectionOwner(display, clipboard), old_owner,
+                         'Do not inject an empty-owner event before native WSLg text arrives')
+        for text in ('中文第一行\n第二行 😀', '原生文本' * 3000):
+            self.own('UTF8_STRING', text)
+            self.assertEqual(self.read('UTF8_STRING'), text)
         self.assertFalse(any(r.startswith(('PULL ', 'EXPORT ', 'EXIMAGE ')) for r in self.requests()))
-
-    def test_new_windows_text_replaces_cached_text(self):
-        self.update('TEXT', text='旧文字'); self.start()
-        self.wait_for(lambda: 'UTF8_STRING' in (self.read('TARGETS') or ''))
-        self.assertEqual(self.read('UTF8_STRING'), '旧文字')
-        self.update('TEXT', text='新文字 😀')
-        self.wait_for(lambda: any(r == 'POLL ' + str(self.seq) for r in self.requests()))
-        self.assertEqual(self.read('UTF8_STRING'), '新文字 😀')
-        self.assertEqual(sum(r.startswith('PULL ') for r in self.requests()), 2)
-
-    def test_image_to_text_offer_is_lazy(self):
-        self.update('IMAGE'); self.start()
-        self.wait_for(lambda: 'image/png' in (self.read('TARGETS') or ''))
-        self.update('TEXT', text='截图后的文字')
-        self.wait_for(lambda: 'UTF8_STRING' in (self.read('TARGETS') or ''))
-        self.assertNotIn('image/png', self.read('TARGETS'))
-        self.assertFalse(any(r.startswith('PULL ') for r in self.requests()))
-        self.assertEqual(self.read('UTF8_STRING'), '截图后的文字')
 
     def test_image_to_native_html_handoff(self):
         self.update('IMAGE'); self.start()
@@ -317,7 +282,7 @@ for line in sys.stdin:
 
 
     @unittest.skipUnless(os.environ.get('MIXED_CLIPBOARD_BINARY'), 'requires a mixed-format application fixture')
-    def test_mixed_text_and_image_exports_text_not_image(self):
+    def test_mixed_text_and_image_copy_stays_native(self):
         self.update('OTHER'); self.start()
         owner = subprocess.Popen([os.environ['MIXED_CLIPBOARD_BINARY']], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  env={**os.environ, 'QT_QPA_PLATFORM': 'xcb'})
@@ -328,12 +293,11 @@ for line in sys.stdin:
         self.addCleanup(stop)
         text = '原生 mixed 文本 😀'
         self.wait_for(lambda: self.read('UTF8_STRING') == text)
-        self.wait_for(lambda: any(r.startswith('EXTEXT ') for r in self.requests()))
+        time.sleep(0.8)
         self.assertIn('image/png', self.read('TARGETS'))
         self.assertIn(text, self.read('text/html'))
-        request = next(r for r in self.requests() if r.startswith('EXTEXT '))
-        self.assertEqual(base64.b64decode(request.split(' ')[2]).decode(), text)
         self.assertFalse(any(r.startswith(('PULL ', 'EXPORT ', 'EXIMAGE ')) for r in self.requests()))
+
 
 
 if __name__ == '__main__': unittest.main()
