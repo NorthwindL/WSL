@@ -109,6 +109,11 @@ class InstallerTests(unittest.TestCase):
             output = subprocess.check_output(['bash', str(script), '--dry-run', *args], text=True)
             self.assertIn('剪贴板模式=' + mode, output)
             self.assertIn('中文环境=是', output)
+            if mode == 'files':
+                self.assertIn('纯文本经桥接写入 Wayland', output)
+            else:
+                self.assertIn('桥接关闭，不传输 Windows 文件', output)
+                self.assertIn('文本和图片均由 WSLg 原生通道处理', output)
         for args, expected in [(['--without-chinese'], '否'),
                                (['--with-chinese'], '是'),
                                (['--without-chinese', '--with-chinese'], '是')]:
